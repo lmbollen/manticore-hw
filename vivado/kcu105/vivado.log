@@ -1,0 +1,44 @@
+#-----------------------------------------------------------
+# Vivado v2022.1 (64-bit)
+# SW Build 3526262 on Mon Apr 18 15:47:01 MDT 2022
+# IP Build 3524634 on Mon Apr 18 20:55:01 MDT 2022
+# Start of session at: Tue Jun  9 08:30:08 2026
+# Process ID: 1882784
+# Current directory: /home/lucas/repos/manticore/manticore-hw/vivado/kcu105
+# Command line: vivado -mode batch -nojournal -source /tmp/report_util_3x3.tcl
+# Log file: /home/lucas/repos/manticore/manticore-hw/vivado/kcu105/vivado.log
+# Journal file: 
+# Running On: lonneker, OS: Linux, CPU Frequency: 3666.050 MHz, CPU Physical cores: 24, Host memory: 67335 MB
+#-----------------------------------------------------------
+source /tmp/report_util_3x3.tcl
+# open_checkpoint /tmp/manticore_3x3_build/manticore_kcu105.runs/synth_1/system_wrapper.dcp
+Command: open_checkpoint /tmp/manticore_3x3_build/manticore_kcu105.runs/synth_1/system_wrapper.dcp
+
+Starting open_checkpoint Task
+
+Time (s): cpu = 00:00:00.01 ; elapsed = 00:00:00.03 . Memory (MB): peak = 2890.215 ; gain = 0.000 ; free physical = 33440 ; free virtual = 64880
+INFO: [Device 21-403] Loading part xcku040-ffva1156-2-e
+Netlist sorting complete. Time (s): cpu = 00:00:00 ; elapsed = 00:00:00 . Memory (MB): peak = 2890.242 ; gain = 0.000 ; free physical = 32921 ; free virtual = 64361
+INFO: [Netlist 29-17] Analyzing 1 Unisim elements for replacement
+INFO: [Netlist 29-28] Unisim Transformation completed in 0 CPU seconds
+INFO: [Project 1-479] Netlist was created with Vivado 2022.1
+INFO: [Project 1-570] Preparing netlist for logic optimization
+CRITICAL WARNING: [Project 1-486] Could not resolve non-primitive black box cell 'system_axi_bram_ctrl_0_0' instantiated as 'system_i/axi_bram_ctrl_0' [/tmp/manticore_3x3_build/manticore_kcu105.gen/sources_1/bd/system/synth/system.v:131]
+CRITICAL WARNING: [Project 1-486] Could not resolve non-primitive black box cell 'system_axi_bram_ctrl_0_bram_0' instantiated as 'system_i/axi_bram_ctrl_0_bram' [/tmp/manticore_3x3_build/manticore_kcu105.gen/sources_1/bd/system/synth/system.v:172]
+CRITICAL WARNING: [Project 1-486] Could not resolve non-primitive black box cell 'system_clk_wiz_0_0' instantiated as 'system_i/clk_wiz_0' [/tmp/manticore_3x3_build/manticore_kcu105.gen/sources_1/bd/system/synth/system.v:180]
+CRITICAL WARNING: [Project 1-486] Could not resolve non-primitive black box cell 'system_jtag_axi_0_0' instantiated as 'system_i/jtag_axi_0' [/tmp/manticore_3x3_build/manticore_kcu105.gen/sources_1/bd/system/synth/system.v:185]
+CRITICAL WARNING: [Project 1-486] Could not resolve non-primitive black box cell 'system_kernel_0_0' instantiated as 'system_i/kernel_0' [/tmp/manticore_3x3_build/manticore_kcu105.gen/sources_1/bd/system/synth/system.v:207]
+CRITICAL WARNING: [Project 1-486] Could not resolve non-primitive black box cell 'system_proc_sys_reset_0_0' instantiated as 'system_i/proc_sys_reset_0' [/tmp/manticore_3x3_build/manticore_kcu105.gen/sources_1/bd/system/synth/system.v:252]
+CRITICAL WARNING: [Project 1-486] Could not resolve non-primitive black box cell 'system_reset_inv_0' instantiated as 'system_i/reset_inv' [/tmp/manticore_3x3_build/manticore_kcu105.gen/sources_1/bd/system/synth/system.v:259]
+CRITICAL WARNING: [Project 1-486] Could not resolve non-primitive black box cell 'system_smartconnect_0_0' instantiated as 'system_i/smartconnect_0' [/tmp/manticore_3x3_build/manticore_kcu105.gen/sources_1/bd/system/synth/system.v:262]
+Netlist sorting complete. Time (s): cpu = 00:00:00 ; elapsed = 00:00:00 . Memory (MB): peak = 2890.242 ; gain = 0.000 ; free physical = 32864 ; free virtual = 64304
+INFO: [Project 1-111] Unisim Transformation Summary:
+  A total of 1 instances were transformed.
+  IBUF => IBUF (IBUFCTRL, INBUF): 1 instance 
+
+INFO: [Project 1-604] Checkpoint was created with Vivado v2022.1 (64-bit) build 3526262
+open_checkpoint: Time (s): cpu = 00:00:04 ; elapsed = 00:00:05 . Memory (MB): peak = 2890.242 ; gain = 0.027 ; free physical = 32864 ; free virtual = 64304
+# report_utilization -file /tmp/util_3x3_synth.rpt
+# puts "=== UTIL REPORT WRITTEN ==="
+=== UTIL REPORT WRITTEN ===
+INFO: [Common 17-206] Exiting Vivado at Tue Jun  9 08:30:18 2026...
