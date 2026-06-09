@@ -268,7 +268,12 @@ class Processor(
     new SimpleDualPortMemory(
       ADDRESS_WIDTH = 14,
       DATA_WIDTH = config.DataBits,
-      STYLE = MemStyle.URAMReal,
+      // URAMReal hardcodes a read latency of 2 and ignores this parameter; the core
+      // pipeline depends on that 2-cycle latency. BRAMLike (used on the no-URAM KCU105
+      // path) DOES honor READ_LATENCY, so it must be pinned to 2 — otherwise reads
+      // arrive a cycle early and the simulated design executes incorrectly.
+      READ_LATENCY = 2,
+      STYLE = MemStyle.uramReal,
       INIT = initial_array
     )
   )

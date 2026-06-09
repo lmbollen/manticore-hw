@@ -98,7 +98,7 @@ class VcdEngine(config: ISA) extends Module {
         ADDRESS_WIDTH = config.IdBits,
         READ_LATENCY = 2,
         DATA_WIDTH = VcdConstants.DataInWidth,
-        STYLE = MemStyle.URAM
+        STYLE = MemStyle.uram
       )
     )
   }

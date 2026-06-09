@@ -128,6 +128,19 @@ class GenericVerilogMemoryFromFile(
 object MemStyle extends Enumeration {
   type MemSyle = Value
   val BRAM, URAM, URAMReal = Value
+
+  // UltraScale parts such as the KCU105's XCKU040 have no URAM. Passing
+  // -Dmanticore.no_uram=true at generation time maps every URAM-backed memory to BRAM
+  // instead. Default (unset/false) preserves the Alveo UltraScale+ behavior.
+  val noUram: Boolean =
+    sys.props.get("manticore.no_uram").exists(v => v == "true" || v == "1")
+
+  // Style to use where a non-initialized URAM was requested.
+  def uram: MemSyle = if (noUram) BRAM else URAM
+  // Style to use where an init-capable URAM (URAMReal) was requested. Note: hardware
+  // initialization is simulation-only for both URAMReal and BRAM (URAM cannot be
+  // config-initialized), so this substitution is behavior-preserving on real silicon.
+  def uramReal: MemSyle = if (noUram) BRAM else URAMReal
 }
 
 class SimpleDualPortMemoryInterface(val ADDRESS_WIDTH: Int, val DATA_WIDTH: Int) extends Bundle {

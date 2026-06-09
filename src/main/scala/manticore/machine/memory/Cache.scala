@@ -341,7 +341,7 @@ class Cache extends Module {
         ADDRESS_WIDTH = 12,
         READ_LATENCY = 2,
         DATA_WIDTH = 72,
-        STYLE = MemStyle.URAM // URAM has higher capacity and can not be initialized
+        STYLE = MemStyle.uram // URAM has higher capacity and can not be initialized (BRAM on -Dmanticore.no_uram)
       )
     )
     bank.suggestName(s"bank_${i}")

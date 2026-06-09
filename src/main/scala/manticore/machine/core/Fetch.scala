@@ -76,7 +76,7 @@ class Fetch(config: ISA) extends Module {
       READ_LATENCY = 2,
       ADDRESS_WIDTH = 12,
       DATA_WIDTH = 64,
-      STYLE = MemStyle.URAM
+      STYLE = MemStyle.uram
     )
   )
 
