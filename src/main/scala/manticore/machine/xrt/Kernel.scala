@@ -154,6 +154,10 @@ class ManticoreFlatSimKernel(
     val kernel_registers = new KernelRegisters
     val kernel_ctrl      = new KernelControl
     val dmi              = new DirectMemoryInterface
+    // diagnostics: observe whether the cache ever writes back to global memory
+    val dbg_axi_writes   = Output(UInt(32.W)) // count of AXI write-address handshakes into axi_mem
+    val dbg_last_awaddr  = Output(UInt(64.W)) // last AXI write byte-address
+    val dbg_last_wdata   = Output(UInt(64.W)) // low 64 bits of the last written cache line
   }
 
   val io = IO(new KernelInterface)
@@ -204,6 +208,22 @@ class ManticoreFlatSimKernel(
   axi_mem.io.sim.wen   := io.dmi.wen
   io.dmi.rdata         := axi_mem.io.sim.rdata
 
+  // diagnostics: count AXI write-address handshakes (cache writebacks) into axi_mem
+  withClockAndReset(clock_distribution.io.control_clock, reset) {
+    val dbgWrites    = RegInit(0.U(32.W))
+    val dbgLastAwadr = RegInit(0.U(64.W))
+    val dbgLastWdata = RegInit(0.U(64.W))
+    when(axi_mem.io.axi.AWVALID && axi_mem.io.axi.AWREADY) {
+      dbgWrites    := dbgWrites + 1.U
+      dbgLastAwadr := axi_mem.io.axi.AWADDR
+    }
+    when(axi_mem.io.axi.WVALID && axi_mem.io.axi.WREADY) {
+      dbgLastWdata := axi_mem.io.axi.WDATA(63, 0)
+    }
+    io.dbg_axi_writes  := dbgWrites
+    io.dbg_last_awaddr := dbgLastAwadr
+    io.dbg_last_wdata  := dbgLastWdata
+  }
 
 }
 
@@ -495,11 +515,17 @@ object ManticoreKernelGenerator {
   object U200 extends Device
   object U250 extends Device
   object U280 extends Device
+  // Non-Vitis target: KCU105 evaluation board (Kintex UltraScale XCKU040). Used by the
+  // plain-Vivado (no v++/xclbin) flow in KCU105Generator.
+  object KCU105 extends Device
 
   case class Platform(name: String, part: String, device: Device)
 
   val platformDevice = Map(
     {
+      val name = "kcu105"
+      name -> Platform(name, "xcku040-ffva1156-2-e", KCU105)
+    }, {
       val name = "xilinx_u200_gen3x16_xdma_1_202110_1"
       name -> Platform(name, "xcu200-fsgd2104-2-e", U200)
     }, {
@@ -633,6 +659,119 @@ object ManticoreKernelGenerator {
 
   }
 
+}
+
+/** Non-Vitis RTL generator for the KCU105 (XCKU040).
+  *
+  * Emits the same `ManticoreFlatKernel.v` as the Alveo flow (with the `keep_hierarchy`
+  * annotations) and generates the support IPs (`clk_dist` clk_wiz, `axi4_clock_converter`,
+  * `axi4lite_clock_converter`) for the part, then STOPS. No `package_xo`, no `v++`: the
+  * kernel is dropped into a plain Vivado block design instead (see `vivado/kcu105/`).
+  *
+  * Run with `-Dmanticore.no_uram=true` so URAM-backed memories map to BRAM (the XCKU040
+  * has no URAM).
+  */
+object KCU105Generator {
+
+  def apply(
+      target_dir: String,
+      dimx: Int = 2,
+      dimy: Int = 2,
+      enable_custom_alu: Boolean = false,
+      freqMhz: Double = 100.0,
+      n_hop: Int = 1,
+      gen_ips: Boolean = true,
+      platform: String = "kcu105"
+  ): Unit = {
+
+    val part    = ManticoreKernelGenerator.platformDevice(platform).part
+    val out_dir = Paths.get(target_dir)
+    val hdl_dir = Files.createDirectories(out_dir.resolve("hdl"))
+
+    if (!MemStyleNoUramCheck.ok) {
+      println(
+        "WARNING: -Dmanticore.no_uram is not set; the XCKU040 has no URAM and synthesis " +
+          "will fail. Re-run generation with -Dmanticore.no_uram=true."
+      )
+    }
+
+    println(s"[kcu105] emitting ManticoreFlatKernel (${dimx}x${dimy}, ${freqMhz} MHz, part ${part})")
+    val vlog = new ChiselStage().emitVerilog(
+      new ManticoreFlatKernel(
+        DimX = dimx,
+        DimY = dimy,
+        enable_custom_alu = enable_custom_alu,
+        debug_enable = false,
+        freqMhz = freqMhz,
+        n_hop = n_hop
+      ),
+      Array(
+        "--target-dir",
+        hdl_dir.toAbsolutePath().toString(),
+        "--no-dedup",
+        "--emission-options=disableMemRandomization,disableRegisterRandomization"
+      )
+    )
+
+    // Same keep_hierarchy annotation as the Alveo flow, so hierarchical constraints work.
+    val vlogWithKeep = vlog
+      .split("\n")
+      .map { line =>
+        val pattern = new Regex(
+          """(\s*)(Processor|Switch|WrappedPipeWithStyle|BoolTree|Management|Programmer)(_\d+)?\s+\w+""",
+          "indent"
+        )
+        pattern.findFirstMatchIn(line) match {
+          case None => line
+          case Some(value) =>
+            val indent = value.group("indent")
+            s"""${indent}(* keep_hierarchy = "yes" *)${line}"""
+        }
+      }
+      .mkString("\n")
+
+    val kernelV = hdl_dir.resolve("ManticoreFlatKernel.v")
+    val w       = Files.newBufferedWriter(kernelV)
+    w.write(vlogWithKeep)
+    w.close()
+
+    // false_path constraint for the reset synchronizer (same as the Alveo packaging).
+    val fp = Files.newBufferedWriter(hdl_dir.resolve("false_path.xdc"))
+    fp.write(
+      """|set_false_path -to [get_pins clock_distribution/rst_sync1_reg/CLR]
+         |set_false_path -to [get_pins clock_distribution/rst_sync2_reg/CLR]
+         |set_false_path -to [get_pins clock_distribution/rst_sync3_reg/CLR]
+         |""".stripMargin
+    )
+    fp.close()
+
+    // Emit the register map header so the JTAG driver has the offsets.
+    val hpp = new PrintWriter(hdl_dir.resolve("register.hpp").toFile)
+    hpp.print(AxiSlave.header)
+    hpp.close()
+
+    println(s"[kcu105] wrote ${kernelV.toAbsolutePath()}")
+
+    import scala.sys.process.{Process, ProcessLogger}
+    val haveVivado = Process("which vivado").!(ProcessLogger(_ => ())) == 0
+    if (gen_ips && haveVivado) {
+      GenerateIPs(
+        ip_dir = out_dir.resolve("ip_location"),
+        scripts_path = out_dir.resolve("scripts"),
+        part_number = part,
+        freq = freqMhz.toString(),
+        cacheline_width = CacheConfig.CacheLineBits
+      )
+      println(s"[kcu105] generated support IPs under ${out_dir.resolve("ip_location")}")
+    } else if (gen_ips) {
+      println("[kcu105] vivado not on PATH; skipping IP generation (emitted RTL only)")
+    }
+  }
+
+  private object MemStyleNoUramCheck {
+    val ok: Boolean =
+      sys.props.get("manticore.no_uram").exists(v => v == "true" || v == "1")
+  }
 }
 
 // object KernelTest extends App {

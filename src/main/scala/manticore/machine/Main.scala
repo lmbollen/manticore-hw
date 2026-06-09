@@ -110,8 +110,8 @@ object Main {
         checkConfig { c =>
           if (!c.do_placement) {
             c.target match {
-              case _ @("hw" | "hw_emu" | "sim") => success
-              case t @ _                        => failure(s"invalid target ${t}")
+              case _ @("hw" | "hw_emu" | "sim" | "kcu105") => success
+              case t @ _                                   => failure(s"invalid target ${t}")
             }
           } else {
             success
@@ -231,6 +231,21 @@ object Main {
             n_hop = cfg.n_hop,
             pblock = cfg.pblock,
             strategies = cfg.strategies
+          )
+
+        case "kcu105" =>
+          // Non-Vitis RTL flow for the KCU105 (XCKU040): emit ManticoreFlatKernel.v and
+          // generate the support IPs for the part; no .xo / no v++ / no xclbin.
+          Console.println(
+            s"Starting KCU105 RTL generation (${cfg.dimx}x${cfg.dimy} @ ${cfg.freq} MHz)"
+          )
+          manticore.machine.xrt.KCU105Generator(
+            target_dir = cfg.output.toPath.toAbsolutePath.toString,
+            dimx = cfg.dimx,
+            dimy = cfg.dimy,
+            enable_custom_alu = cfg.enable_custom_alu,
+            freqMhz = cfg.freq,
+            n_hop = cfg.n_hop
           )
 
         case "sim" =>
