@@ -14,3 +14,4 @@ test_data_dir
 project
 junk
 __pycache__/
+vivado/kcu105/.Xil/

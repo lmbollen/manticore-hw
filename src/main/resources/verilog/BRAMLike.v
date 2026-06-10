@@ -61,6 +61,11 @@ module BRAMLike #(
       .MESSAGE_CONTROL(0),  //integer; 0,1
       .ECC_MODE ("no_ecc"), //string; "no_ecc", "encode_only", "decode_only" or "both_encode_and_decode"
       .AUTO_SLEEP_TIME(0),  //Do not Change
+      // No dedicated BRAM cascade chains: the CASDIN* cascade pins are fixed routes whose
+      // hold slack is set by clock skew between the cascaded BRAMs and cannot be fixed by
+      // phys_opt (observed -46ps hold on the 16K-deep scratchpads). Fabric muxing instead
+      // costs a few LUTs and is hold-clean; setup has ample margin at the 100 MHz compute clock.
+      .CASCADE_HEIGHT(1),
       // Port A module parameters
       .WRITE_DATA_WIDTH_A(DATA_WIDTH),  //positive integer
       .BYTE_WRITE_WIDTH_A(DATA_WIDTH),  //integer; 8, 9, or WRITE_DATA_WIDTH_A value

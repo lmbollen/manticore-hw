@@ -224,6 +224,11 @@ if {$stop_after eq "synth"} { exit 0 }
 # ---------------------------------------------------------------------------
 # 6. Implementation + bitstream
 # ---------------------------------------------------------------------------
+# Post-route phys_opt with hold-fixing: the BRAM-cascade paths inside the per-core
+# scratchpads close setup with margin but can come out of route_design with ps-level
+# hold violations (e.g. -46ps on CASDINB pins). AggressiveExplore includes hold fixing.
+set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.IS_ENABLED true [get_runs impl_1]
+set_property STEPS.POST_ROUTE_PHYS_OPT_DESIGN.ARGS.DIRECTIVE AggressiveExplore [get_runs impl_1]
 launch_runs impl_1 -to_step write_bitstream -jobs 8
 wait_on_run impl_1
 if {[get_property PROGRESS [get_runs impl_1]] ne "100%"} {

@@ -1,10 +1,29 @@
 # 4×4 missed MIPS display — RESOLVED: westbound boot packets misrouted at the master switch
 
-**Status: FIXED.** Root cause was a missing case in the bidirectional `Switch`'s `xInput`
-handler, triggered by the Programmer's boot-packet injection path. After the one-line fix,
-both 2×2 and 4×4 MIPS32 RTL co-sims pass with the exact golden signature
-(53 vcycles / 32 flushes / 31 RF-write displays / eid 3), and all cores start their virtual
-cycles simultaneously.
+**Status: FIXED — and verified on the board.** Root cause was a missing case in the
+bidirectional `Switch`'s `xInput` handler, triggered by the Programmer's boot-packet
+injection path. After the one-line fix, both 2×2 and 4×4 MIPS32 RTL co-sims pass with the
+exact golden signature (53 vcycles / 32 flushes / 31 RF-write displays / eid 3), and all
+cores start their virtual cycles simultaneously.
+
+**Board verification (2026-06-10):** the fixed 4×4 design was synthesized for the KCU105
+(xcku040, 200 MHz axi / 100 MHz compute, 64% BRAM; bitstream
+`manticore_kcu105_4x4_bidir.bit`) and run on the physical board via JTAG-to-AXI
+(`run_manifest.py` flow, same `--no-cf` image as the simulation). Result:
+`FINISH (eid=0x3) vcycles=53 after 32 flushes — PASS` — an exact match to the RTL
+simulation and the placed interpreter. The bidirectional NoC (including the westbound boot
+path through the fixed crossover) works on silicon.
+
+Timing closure note: the first build had 7 hold violations (worst −46 ps) on the dedicated
+BRAM cascade (`CASDIN*`) inside a scratchpad — an artifact of the URAM→BRAM port (the
+16K×16 scratchpads map to 8 cascaded BRAM36s; cascade hold is clock-skew-determined and
+not fixable by phys_opt). Fixed structurally with `CASCADE_HEIGHT(1)` in `BRAMLike.v`
+(fabric mux instead of dedicated cascade; sim path unaffected) plus post-route phys_opt in
+`build_kcu105.tcl`. Final timing: **WNS +0.487 ns / WHS +0.030 ns, 0 failing endpoints**;
+the board re-run with the clean bitstream reproduced the identical golden result. The
+critical setup path is shell glue (axi_bram_ctrl → backing BRAM @200 MHz); the compute
+clock has ~4 ns of slack at 100 MHz, and the topology limiter on the xcku040 is BRAM
+capacity (64% at 4×4), not timing.
 
 > History: two earlier hypotheses were investigated and disproven along the way — an
 > "exception-capture race" (disproven: the 31 displays come from ONE predicated FLUSH fired
