@@ -176,12 +176,6 @@ class SwitchInterface(DimX: Int, DimY: Int, config: ISA) extends Bundle {
   * @param config
   * @param n_hop pipeline register depth per hop (1 = registered once, 2 = two stages, …)
   */
-object Switch {
-  // Toggle the simulation-only packet-drop detector with -Dmanticore.debug_drops=true.
-  val DEBUG_DROPS: Boolean =
-    sys.props.get("manticore.debug_drops").exists(v => v == "true" || v == "1")
-}
-
 class Switch(DimX: Int, DimY: Int, config: ISA, n_hop: Int) extends Module {
   val io = IO(new SwitchInterface(DimX, DimY, config))
 
@@ -258,6 +252,15 @@ class Switch(DimX: Int, DimY: Int, config: ISA, n_hop: Int) extends Module {
   when(io.xInput.valid) {
     when(io.xInput.xHops > 0.S) {
       x_reg := NoCBundle.passX(io.xInput)            // continue east
+    }.elsewhen(io.xInput.xHops < 0.S) {
+      // Westbound packet entering via xInput: crossover to the x_neg channel. Genuine
+      // eastbound transit never has xHops<0 (hops only move toward zero), so this branch
+      // only fires for packets INJECTED at this port — the Programmer drives all boot/config
+      // packets into the master switch's xInput, including westbound-encoded destinations
+      // (signed shortest-path boot hops). Without this branch such packets skip their X
+      // routing entirely and are mis-delivered to column-0 cores, whose boot FSMs consume
+      // them as countdown words and start their virtual cycles staggered instead of aligned.
+      x_neg_reg := NoCBundle.passX(io.xInput)        // crossover: go west
     }.elsewhen(io.xInput.yHops > 0.S) {
       y_reg        := NoCBundle.passY(io.xInput)     // turn north
       terminal_reg := false.B
