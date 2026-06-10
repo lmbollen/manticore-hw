@@ -239,6 +239,54 @@ virtual/structural constructs the compiler needs; and the `SEND` hop encoding / 
 stream is where the **topology** (grid dimensions, signed bidirectional hops, per-link
 latencies from `--hop-latencies`) gets baked into otherwise topology-agnostic programs.
 
+---
+
+## Boot: from an unprogrammed array to a running simulation
+
+Five stages (`Management.scala`, `Programmer.scala`, the `Processor` boot FSM):
+
+**0 — Host loads the image.** The compiler's binaries (`init_0`, `init_1`, `main`) are
+laid out into one flat 16-bit-word image (first 16Ki words reserved for the trace
+buffer and the simulated design's global memories) and written into global memory
+(JTAG-to-AXI on the KCU105, the DMI in simulation, XRT on Alveo). Per run the host sets
+`DramBank0Base`, `GlobalMemoryInstructionBase` (this binary's boot stream), the
+`ScheduleConfig` command word, and pulses `ap_start`. **Each binary gets its own full
+boot+run cycle**: the initializers run first (ordinary programs that populate the
+simulated design's memories, ending in FINISH), then `main`.
+
+**1 — Management brings the array up.** `sIdle → sCoreReset → sCacheReset → sBoot`:
+soft-reset tree through all cores (every core wakes in `DynamicReceiveProgramLength`
+with empty instruction memory), cache reset, then `boot_start` to the Programmer with
+the compute clock held on (the NoC is the boot medium).
+
+**2 — The Programmer streams programs over the NoC.** It reads the boot stream from
+memory through the cache and injects packets at the master switch's `xInput`. Per core,
+in block order: the dest word (consumed — it becomes the packet's **signed** hop
+counts), then `body_length`, 4×16-bit packets per 64-bit instruction, `epilogue_length`
+(= expected receives) and `sleep_length`. The target core's FSM reassembles
+instructions (4-chunk shift register) into its instruction memory and parks in
+`DynamicReceiveCountDown`.
+
+**3 — The alignment countdown.** `StreamCountDown` sends one packet per cycle,
+farthest core first, with hop-compensated countdown values
+(`D₀ = DimX·DimY − (DimX+DimY−1)`, decreasing per row) so that send-time + travel +
+D is identical everywhere: every core's countdown reaches zero **on the same cycle**
+and all enter `StaticExecutionPhase` together. The Programmer then waits out its own
+pipeline depth (`WaitForCountDownEnd1..3`) and asserts `running` → Management enters
+`sVirtualCycle`. This is the only synchronization event the architecture ever
+performs; equal periods preserve the alignment forever (and any boot-time corruption
+of it — e.g. the misrouted-westbound-packet bug — persists forever too).
+
+**4 — Steady state and the host conversation.** The array runs the BSP loop
+autonomously; Management counts virtual cycles on the master core's sleep transitions.
+On an `EXPECT` exception it gates the compute clock (everything freezes in lockstep,
+packets included), latches the eid and signals done. FLUSH → host cache-flushes, reads
+the trace, sends resume (the array thaws mid-vcycle exactly where it froze);
+FINISH → run complete, host proceeds to the next binary or reports
+`vcycles` = simulated design clock cycles.
+
+---
+
 Related reading: `docs/kcu105/MULTICHIP-ADDRESSING.md` (how the addressing scales to
 multi-chip tori), the top-level `README.md` in the umbrella directory (the full
 topology→silicon flow), and the instruction-format figures in `docs/`
