@@ -5,6 +5,14 @@ Goal (per the request): extend the topology from a **single 2D torus** (one chip
 **addressing space**, with the directly-coupled latency/lockstep issues called out because the
 addressing is only *correct* if those hold.
 
+> **Status update (2026-06-10):** since this investigation was written, the NoC has been made
+> **bidirectional** (signed hops, min-|hops| shortest-path routing; verified in sim and on the
+> KCU105 board), and the **"flatten" scheme's boundary router is implemented**: `TorusBoundary`
+> (+ `BareNoC.extendX/extendY` with `torusDimX/torusDimY` hop sizing) conditionally closes each
+> ring locally or chains instances into a larger torus at **runtime** — verified by
+> `TorusExtensionTester` (two 2×2 instances forming 4×2 or 2×4, and two 4×4 forming 8×4, by a
+> boolean). Sections below are updated accordingly.
+
 ## How addressing works today (single torus)
 
 A NoC packet (`Switch.scala`) is:
@@ -13,17 +21,19 @@ A NoC packet (`Switch.scala`) is:
 |---|---|---|
 | `data` | `DataBits` = 16 | the value being sent |
 | `address` | `IdBits` = **11** (2048) | the destination **register id** — *which register* at the destination core receives the value |
-| `xHops` | `log2Ceil(DimX)` | how many hops in +X to the destination core |
-| `yHops` | `log2Ceil(DimY)` | how many hops in +Y |
+| `xHops` | `log2Ceil(DimX)+1` (**signed**) | hops in X to the destination core; sign = direction (+ east / − west) |
+| `yHops` | `log2Ceil(DimY)+1` (**signed**) | hops in Y; sign = direction (+ north / − south) |
 | `valid` | 1 | — |
 
 Two facts dominate everything below:
 
-1. **Addressing is purely *relative*.** A packet says "go `xHops` in +X, then `yHops` in +Y, then
-   deliver." Each switch decrements (`Switch.scala:87/100/195…`); when both reach 0 it delivers
+1. **Addressing is purely *relative*.** A packet says "go `xHops` in X, then `yHops` in Y, then
+   deliver." Each switch moves the count one step **toward zero**; when both reach 0 it delivers
    locally. **There are no absolute core coordinates anywhere in the NoC.** The torus is
-   *unidirectional* (the compiler always routes forward with wraparound — `HardwareConfig.xHops`:
-   `if source.x > target.x then dimX - source.x + target.x else target.x - source.x`).
+   **bidirectional**: hops are signed, each direction has its own physical channel per ring
+   (`x_reg`/`x_neg_reg`, `y_reg`/`y_neg_reg` — opposite directions verified non-interfering even
+   in the same cycle on the same ring), and the compiler routes **min-|hops| shortest-path**
+   (`HardwareConfig.xHops`: forward vs backward distance, smaller wins, ties break forward).
 2. **The "where" and the "what" are separate.** `xHops/yHops` locate the *core* (topology-dependent);
    `address` selects the *register* (per-core, **topology-independent**, always 2048).
 
@@ -39,15 +49,17 @@ analog to a chip-to-chip hop.
 ## Consequences for the addressing space
 
 ### 1. The relative-hop fields are sized for one chip — they must grow
-`xHops/yHops` hold only `log2Ceil(DimX)/log2Ceil(DimY)` bits (e.g. 2 bits each for 4×4 → max 3
-hops). A grid of `Cx×Cy` chips, each `Dx×Dy`, spans a total of `(Cx·Dx)×(Cy·Dy)` cores. To address
-across it the hop fields must widen to `log2Ceil(Cx·Dx)/log2Ceil(Cy·Dy)` bits:
+`xHops/yHops` hold `log2Ceil(DimX)+1 / log2Ceil(DimY)+1` **signed** bits (e.g. 3/3 for 4×4,
+covering ±2 shortest-path hops). A grid of `Cx×Cy` chips, each `Dx×Dy`, spans a total of
+`(Cx·Dx)×(Cy·Dy)` cores. To address across it the hop fields must widen to
+`log2Ceil(Cx·Dx)+1 / log2Ceil(Cy·Dy)+1` bits (implemented: `BareNoC(torusDimX, torusDimY)`
+sizes the bundles for the global torus while the local array stays `Dx×Dy`):
 
-| System | Total grid | hop-field bits (was 2/2) |
+| System | Total grid | signed hop-field bits (single 4×4 chip: 3/3) |
 |---|---|---|
-| 2×2 grid of 4×4 | 8×8 = 64 | 3 / 3 |
-| 4×4 grid of 4×4 | 16×16 = 256 | 4 / 4 |
-| 8×8 grid of 4×4 | 32×32 = 1024 | 5 / 5 |
+| 2×2 grid of 4×4 | 8×8 = 64 | 4 / 4 |
+| 4×4 grid of 4×4 | 16×16 = 256 | 5 / 5 |
+| 8×8 grid of 4×4 | 32×32 = 1024 | 6 / 6 |
 
 Every packet, every switch's hop register, and every decrement widen. **The `address` (register-id)
 field does NOT change** — each core still has 2048 registers. So the address space grows *only* in
@@ -60,8 +72,10 @@ its spatial part.
   are *repurposed as inter-chip links* to the neighbour, and the wrap moves to the system perimeter.
 - Addressing change = **just widen `xHops/yHops`**; routing logic is unchanged (dimension-order).
 - **This is the natural fit**, precisely because the NoC has *no absolute coordinates*: flattening
-  keeps everything relative. Catch: it is literally a bigger torus, the edge-link rewiring is fixed
-  at build time, and per-hop latency is no longer uniform (§4).
+  keeps everything relative. The edge-link selection is now **runtime-switchable** (implemented:
+  `TorusBoundary` closes each ring locally or hands its two directed strings to the neighbour,
+  per dimension, on a boolean). Remaining catch: per-hop latency is no longer uniform if the
+  physical link adds cycles (§4).
 
 **(b) True hierarchical "grid of tori"** — absolute chip coordinate + intra-chip hops.
 - Add a `(chipX, chipY)` field to the packet; chip-edge "gateway" switches forward toward the
@@ -90,10 +104,13 @@ So:
   `slrCrossingLatency` pipeline, scaled up. An elastic/async SerDes (variable-latency FIFO) **breaks
   static scheduling** and is not usable as-is; the link needs a phase-aligned, fixed-latency
   (or deterministically-padded) crossing.
-- Because the torus is unidirectional, worst-case hop distance is `(W-1)+(H-1)` of the *whole*
-  grid (e.g. 8×8 → 14 hops). With some of those hops now costly inter-chip crossings, the **per
-  virtual-cycle sync latency grows** → the virtual-cycle length (and so the sim-time floor) rises.
-  This is a real throughput cost of going multi-chip, independent of the bit-width changes.
+- With the **bidirectional** torus (min-|hops| shortest path), worst-case hop distance is
+  `⌊W/2⌋+⌊H/2⌋` of the *whole* grid (e.g. 8×8 → 8 hops; the old unidirectional torus needed
+  `(W-1)+(H-1)` = 14) — bidirectionality **halves the worst-case distance**, which is exactly
+  what makes scaling to large multi-chip topologies viable. Still, with some hops being costly
+  inter-chip crossings, the **per virtual-cycle sync latency grows** → the virtual-cycle length
+  (and so the sim-time floor) rises. This is a real throughput cost of going multi-chip,
+  independent of the bit-width changes.
 
 ### 5. Global-memory (48-bit) addressing — partitioning, not width
 Global load/store use 48-bit addresses owned by the single privileged core (core (0,0)) per chip.

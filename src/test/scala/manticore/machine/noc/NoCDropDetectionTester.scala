@@ -145,4 +145,56 @@ class NoCDropDetectionTester extends AnyFlatSpec with ChiselScalatestTester with
           s"expected the lower-priority southbound frame (B) to be the dropped one, got $dropped")
       }
   }
+
+  // Bidirectionality under concurrency: the torus rings are BIDIRECTIONAL — each direction
+  // has its own physical channel (x_reg/x_neg_reg, y_reg/y_neg_reg), so opposite-direction
+  // traffic on the SAME ring in the SAME cycles must not interfere. Inject four packets in
+  // one cycle: east+west sharing row 1, north+south sharing column 0, all with distinct
+  // terminal switches. All four must be delivered exactly once at latency hops+1.
+  it should "carry simultaneous opposite-direction traffic on shared rings without interference" taggedAs RequiresVerilator in {
+    test(new BareNoC(DIMX, DIMY, config, n_hop = 1))
+      .withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
+        dut.io.configEnable.poke(false.B)
+        allEmpty(dut)
+        dut.clock.step(2)
+
+        // (data, src, dst, xh, yh, expected latency = |xh|+|yh|+1)
+        case class T(data: Int, sx: Int, sy: Int, tx: Int, ty: Int, xh: Int, yh: Int) {
+          val lat = math.abs(xh) + math.abs(yh) + 1
+        }
+        // NOTE on the pattern: opposite-direction TRANSIT uses disjoint registers
+        // (x_reg vs x_neg_reg, y_reg vs y_neg_reg) and can never interfere; only
+        // TERMINAL delivery shares y_reg with northbound transit (a known, compiler-
+        // arbitrated contention — scheduled traffic never collides there). The pattern
+        // below keeps all terminals on distinct switches and clear of transits.
+        val traffic = Seq(
+          T(0xE0E0, 0, 1, 2, 1, +2, 0), // eastbound  on row 1
+          T(0x3030, 3, 1, 1, 1, -2, 0), // westbound  on row 1   (opposite direction, same ring)
+          T(0x4040, 0, 0, 0, 2, 0, +2), // northbound on col 0
+          T(0x5050, 0, 3, 0, 1, 0, -2)  // southbound on col 0   (opposite direction, same ring)
+        )
+        allEmpty(dut)
+        traffic.foreach(t => dut.io.corePacketInput(t.sx)(t.sy).poke(mkPkt(t.data, 0x3, t.xh, t.yh)))
+        dut.clock.step()
+        allEmpty(dut)
+
+        val delivered = scala.collection.mutable.ArrayBuffer.empty[(Int, Int, Int, Int)] // (x,y,data,cycle)
+        var c = 1
+        while (c <= 8) {
+          for (x <- 0 until DIMX; y <- 0 until DIMY) {
+            if (dut.io.corePacketOutput(x)(y).valid.peek().litToBoolean)
+              delivered += ((x, y, dut.io.corePacketOutput(x)(y).data.peek().litValue.toInt & 0xffff, c))
+          }
+          dut.clock.step(); c += 1
+        }
+
+        info(s"simultaneous bidirectional traffic: delivered ${delivered.map(d => f"(${d._1},${d._2})=0x${d._3}%04x@${d._4}").mkString(", ")}")
+        assert(delivered.size == traffic.size, s"expected ${traffic.size} deliveries, saw ${delivered.size}")
+        traffic.foreach { t =>
+          val hits = delivered.filter(d => d._1 == t.tx && d._2 == t.ty && d._3 == t.data)
+          assert(hits.size == 1, s"packet 0x${t.data.toHexString} to (${t.tx},${t.ty}) delivered ${hits.size} times")
+          assert(hits.head._4 == t.lat, s"packet 0x${t.data.toHexString}: latency ${hits.head._4} != ${t.lat}")
+        }
+      }
+  }
 }
