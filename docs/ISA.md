@@ -86,9 +86,42 @@ how the compiler builds wide adders from 16-bit limbs).
 - 16 Ki-word scratchpad (URAM on Alveo, BRAM on the KCU105),
 - 4096-deep instruction memory.
 
-**There is no control flow.** No branches or jumps — the PC increments through a static
-schedule; the compiler turns control flow into `MUX`/predication (the IR's `JumpTable`
-is fully lowered away before code generation).
+### Execution model: linear and periodic — no flow control
+
+**There are no flow-control instructions.** None of the 14 opcodes touches the PC, and
+the fetch unit has no branch path at all (`Fetch.scala`): while execution is enabled the
+PC increments by 1 every cycle; at the final instruction it resets to 0. Each core's
+program is therefore a straight line executed identically every virtual cycle:
+
+```
+        ┌──────────── one virtual cycle (length L, same for every core) ───────────┐
+core i: │ body (compute)  │ epilogue (Recv slots / NoC padding) │ sleep (L − N_i)   │ → repeat from PC=0
+```
+
+`body+epilogue` = the core's `N_i` instructions; `sleep_length` pads every core to the
+common period `L` so all cores re-enter execution simultaneously — the BSP superstep.
+One virtual cycle simulates one clock cycle of the design under test; state carries
+across vcycles only through registers/scratchpad (the `_curr/_next` reg pairs).
+
+Where "control flow" went:
+
+- **Data-level**: the compiler computes both sides and selects — `MUX`, `PREDICATE`d
+  stores, `SLICE`; the IR's `ParMux`/`JumpTable`/`Phi` case constructs are normalized
+  and lowered away before scheduling (`JumpTableNormalizationTransform`; the scheduler
+  errors if one survives — "JumpTables are a thing of the past", and the hardware never
+  had a jump).
+- **System-level**: the only run-time control events are `EXPECT` exceptions — the
+  Management controller gates the compute clock (the whole array freezes in lockstep),
+  reports the eid, and the host decides: service a FLUSH and resume, or stop on
+  FINISH/STOP/ASSERT. Resuming continues exactly where the array froze; it does not
+  alter the program.
+- **Boot-level**: the processor's FSM phases (receive program → countdown → execute ⇄
+  sleep) wrap the program but are not instructions.
+
+Consequence: execution time is fully static — `L` is known at compile time, a simulated
+design clock always costs exactly `L` Manticore cycles, and the NoC schedule can assume
+every instruction's issue cycle. This determinism is the foundation the whole
+architecture (NoC reservations, Recv placement, multi-chip latency modeling) rests on.
 
 ---
 
