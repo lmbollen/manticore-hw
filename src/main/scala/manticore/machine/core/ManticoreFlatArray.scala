@@ -144,16 +144,25 @@ class ComputeArray(
   // connect the cores via switches
   Range(0, dimx).foreach { x =>
     Range(0, dimy).foreach { y =>
+      // Eastbound (+X): packet from x-1 enters this switch; wrap from dimx-1 to 0
       cores(x)(y).switch.io.xInput := {
-        if (x == 0)
-          cores(dimx - 1)(y).switch.io.xOutput
-        else cores(x - 1)(y).switch.io.xOutput
+        if (x == 0) cores(dimx - 1)(y).switch.io.xOutput
+        else        cores(x - 1)(y).switch.io.xOutput
       }
+      // Westbound (-X): packet from x+1 enters this switch; wrap from 0 to dimx-1
+      cores(x)(y).switch.io.xNegInput := {
+        if (x == dimx - 1) cores(0)(y).switch.io.xNegOutput
+        else                cores(x + 1)(y).switch.io.xNegOutput
+      }
+      // Northbound (+Y): packet from y-1 enters this switch; wrap from dimy-1 to 0
       cores(x)(y).switch.io.yInput := {
-        if (y == 0)
-          cores(x)(dimy - 1).switch.io.yOutput
-        else
-          cores(x)(y - 1).switch.io.yOutput
+        if (y == 0) cores(x)(dimy - 1).switch.io.yOutput
+        else        cores(x)(y - 1).switch.io.yOutput
+      }
+      // Southbound (-Y): packet from y+1 enters this switch; wrap from 0 to dimy-1
+      cores(x)(y).switch.io.yNegInput := {
+        if (y == dimy - 1) cores(x)(0).switch.io.yNegOutput
+        else                cores(x)(y + 1).switch.io.yNegOutput
       }
 
       if (debug_enable) {
@@ -174,9 +183,17 @@ class ComputeArray(
           if (x == 0) cores(dimx - 1)(y).switch.io.xOutput
           else cores(x - 1)(y).switch.io.xOutput
         }
+        switch_watcher.io.xNegInput := {
+          if (x == dimx - 1) cores(0)(y).switch.io.xNegOutput
+          else cores(x + 1)(y).switch.io.xNegOutput
+        }
         switch_watcher.io.yInput := {
           if (y == 0) cores(x)(dimy - 1).switch.io.yOutput
           else cores(x)(y - 1).switch.io.yOutput
+        }
+        switch_watcher.io.yNegInput := {
+          if (y == dimy - 1) cores(x)(0).switch.io.yNegOutput
+          else cores(x)(y + 1).switch.io.yNegOutput
         }
         switch_watcher.io.lInput := cores(x)(y).core.io.packet_out
 

@@ -107,13 +107,13 @@ class UniProcessorSimpleCounterTester extends AnyFlatSpec with Matchers with Chi
                   // println(counter)
                   // println(s"Got ${dut.io.packet_out.data.peekInt()} expected ${counter}")
                   dut.io.packet_out.data.expect(counter.U)
-                  dut.io.packet_out.xHops.expect(2.U)
-                  dut.io.packet_out.yHops.expect(2.U)
+                  dut.io.packet_out.xHops.expect(2.S)
+                  dut.io.packet_out.yHops.expect(2.S)
                   (counter + 1, expected)
                 } else {
                   dut.io.packet_out.data.expect(expected.head.U)
-                  dut.io.packet_out.xHops.expect(expected.head.U)
-                  dut.io.packet_out.yHops.expect(expected.head.U)
+                  dut.io.packet_out.xHops.expect(expected.head.S)
+                  dut.io.packet_out.yHops.expect(expected.head.S)
                   (counter, expected.tail)
                 }
               } else {

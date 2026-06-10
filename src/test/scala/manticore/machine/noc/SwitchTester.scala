@@ -52,23 +52,23 @@ class SwitchTester extends AnyFlatSpec  with ChiselScalatestTester with Matchers
   def randomPacketX: NoCBundle = SwitchTestUtils.randomPacketX(DIMX, DIMY, config)(rdgen)
   def emptyPacket: NoCBundle = SwitchTestUtils.emptyPacket(DIMX, DIMY, config)
 
+  // hop litValue() is now a signed BigInt; helpers still work for positive hops
   def passX(orig: NoCBundle): NoCBundle = {
-
     NoCBundle(DIMX, DIMY, config).Lit(
-      _.data -> orig.data,
+      _.data    -> orig.data,
       _.address -> orig.address,
-      _.valid -> true.B,
-      _.xHops -> (orig.xHops.litValue - 1).U,
-      _.yHops -> orig.yHops
+      _.valid   -> true.B,
+      _.xHops   -> (orig.xHops.litValue - 1).toInt.S,
+      _.yHops   -> orig.yHops
     )
   }
   def passY(orig: NoCBundle): NoCBundle = {
     NoCBundle(DIMX, DIMY, config).Lit(
-      _.data -> orig.data,
+      _.data    -> orig.data,
       _.address -> orig.address,
-      _.valid -> true.B,
-      _.xHops -> orig.xHops,
-      _.yHops -> (orig.yHops.litValue - 1).U
+      _.valid   -> true.B,
+      _.xHops   -> orig.xHops,
+      _.yHops   -> (orig.yHops.litValue - 1).toInt.S
     )
   }
 
@@ -76,17 +76,18 @@ class SwitchTester extends AnyFlatSpec  with ChiselScalatestTester with Matchers
     require(orig.yHops.litValue == 0 & orig.xHops.litValue == 0,
       s"Can not invalidate a non-terminal packet %s".format(orig))
     NoCBundle(DIMX, DIMY, config).Lit(
-      _.data -> orig.data,
+      _.data    -> orig.data,
       _.address -> orig.address,
-      _.valid -> false.B,
-      _.xHops -> orig.xHops,
-      _.yHops -> orig.yHops
+      _.valid   -> false.B,
+      _.xHops   -> orig.xHops,
+      _.yHops   -> orig.yHops
     )
   }
+  // routeFromLocal / routeFromX: positive hop check (signed, but tests only use positive hops)
   def routeFromLocal(packet: NoCBundle) = {
-    if (packet.xHops.litValue != 0 ) {
+    if (packet.xHops.litValue > 0 ) {
       SwitchPort.X
-    } else if (packet.yHops.litValue != 0) {
+    } else if (packet.yHops.litValue > 0) {
       SwitchPort.Y
     } else {
       SwitchPort.L
@@ -94,6 +95,13 @@ class SwitchTester extends AnyFlatSpec  with ChiselScalatestTester with Matchers
   }
   def routeFromX(packet: NoCBundle) = {
     routeFromLocal(packet)
+  }
+
+  // Drive the new bidirectional ports to empty in every test — they carry no traffic
+  // in the existing unidirectional test cases.
+  def pokeNegEmpty(dut: Switch): Unit = {
+    dut.io.xNegInput.poke(emptyPacket)
+    dut.io.yNegInput.poke(emptyPacket)
   }
 
   behavior of "Switch"
@@ -107,6 +115,7 @@ class SwitchTester extends AnyFlatSpec  with ChiselScalatestTester with Matchers
         dut.io.lInput.poke(packet)
         dut.io.yInput.poke(emptyPacket)
         dut.io.xInput.poke(emptyPacket)
+        pokeNegEmpty(dut)
         dut.clock.step()
 
         routeFromLocal(packet) match {
@@ -136,6 +145,7 @@ class SwitchTester extends AnyFlatSpec  with ChiselScalatestTester with Matchers
         dut.io.lInput.poke(packet)
         dut.io.yInput.poke(emptyPacket)
         dut.io.xInput.poke(emptyPacket)
+        pokeNegEmpty(dut)
         dut.clock.step(2)
 
         routeFromLocal(packet) match {
@@ -148,7 +158,7 @@ class SwitchTester extends AnyFlatSpec  with ChiselScalatestTester with Matchers
             dut.io.yOutput.expect(emptyPacket, s"[%d] expected empty packet on port y, got %s"
               .format(i, dut.io.yOutput.peek()))
           case SwitchPort.L =>
-            dut.io.xOutput.expect(emptyPacket, s"[%d] expected empty packet on port X, got %s"
+            dut.io.xOutput.expect(emptyPacket, s"[%d] Expected empty packet on port X, got %s"
               .format(i, dut.io.xOutput.peek()))
             dut.io.yOutput.expect(emptyPacket, s"[%d] expected empty packet on port y, got %s"
               .format(i, dut.io.yOutput.peek()))
@@ -166,6 +176,7 @@ class SwitchTester extends AnyFlatSpec  with ChiselScalatestTester with Matchers
         dut.io.lInput.poke(packetL)
         dut.io.xInput.poke(emptyPacket)
         dut.io.yInput.poke(packetY)
+        pokeNegEmpty(dut)
         dut.clock.step()
 
         def checkY(): Unit =
@@ -203,6 +214,7 @@ class SwitchTester extends AnyFlatSpec  with ChiselScalatestTester with Matchers
         dut.io.lInput.poke(packetL)
         dut.io.xInput.poke(emptyPacket)
         dut.io.yInput.poke(packetY)
+        pokeNegEmpty(dut)
         dut.clock.step(2)
 
         def checkY(): Unit =
@@ -242,6 +254,7 @@ class SwitchTester extends AnyFlatSpec  with ChiselScalatestTester with Matchers
         dut.io.xInput.poke(packetX)
         dut.io.yInput.poke(packetY)
         dut.io.lInput.poke(emptyPacket)
+        pokeNegEmpty(dut)
 
         dut.clock.step()
         routeFromX(packetX) match {
@@ -289,6 +302,7 @@ class SwitchTester extends AnyFlatSpec  with ChiselScalatestTester with Matchers
         dut.io.xInput.poke(packetX)
         dut.io.yInput.poke(packetY)
         dut.io.lInput.poke(emptyPacket)
+        pokeNegEmpty(dut)
 
         dut.clock.step(2)
         routeFromX(packetX) match {
@@ -339,6 +353,7 @@ class SwitchTester extends AnyFlatSpec  with ChiselScalatestTester with Matchers
         dut.io.xInput.poke(packetX)
         dut.io.yInput.poke(emptyPacket)
         dut.io.lInput.poke(packetL)
+        pokeNegEmpty(dut)
         dut.clock.step()
         (routeFromX(packetX), routeFromLocal(packetL)) match {
           case (SwitchPort.X, SwitchPort.X | SwitchPort.L) =>
@@ -393,6 +408,7 @@ class SwitchTester extends AnyFlatSpec  with ChiselScalatestTester with Matchers
         dut.io.xInput.poke(packetX)
         dut.io.yInput.poke(emptyPacket)
         dut.io.lInput.poke(packetL)
+        pokeNegEmpty(dut)
         dut.clock.step(2)
         (routeFromX(packetX), routeFromLocal(packetL)) match {
           case (SwitchPort.X, SwitchPort.X | SwitchPort.L) =>

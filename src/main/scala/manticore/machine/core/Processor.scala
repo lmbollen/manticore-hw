@@ -534,10 +534,14 @@ class Processor(
 
   register_file.io.w.addr := memory_stage.io.pipe_out.rd
 
-  // io.packet_out := memory_stage.io.pipe_out.packet
+  // The SEND instruction immediate encodes xHops in the low half and yHops in the high half,
+  // each as a signed 2's complement value (positive = forward, negative = backward).
+  // The ONLY change from the working unidirectional baseline is the .asSInt reinterpretation,
+  // since NoCBundle.xHops/yHops are now SInt. Pipeline alignment is otherwise identical to
+  // the baseline (no extra RegNext) — the baseline timing was already correct.
   val hop_bits: Int = decode_stage.io.pipe_out.immediate.getWidth / 2
-  io.packet_out.xHops   := decode_stage.io.pipe_out.immediate.tail(hop_bits)
-  io.packet_out.yHops   := decode_stage.io.pipe_out.immediate.head(hop_bits)
+  io.packet_out.xHops   := decode_stage.io.pipe_out.immediate.tail(hop_bits).asSInt
+  io.packet_out.yHops   := decode_stage.io.pipe_out.immediate.head(hop_bits).asSInt
   io.packet_out.data    := register_file.io.rs2.dout
   io.packet_out.address := decode_stage.io.pipe_out.rd
   io.packet_out.valid   := decode_stage.io.pipe_out.opcode.send

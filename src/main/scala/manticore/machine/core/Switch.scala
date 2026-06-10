@@ -43,8 +43,11 @@ class BareNoCBundle(val config: ISA) extends Bundle {
   *   the configuration of the processors
   */
 class NoCBundle(val DimX: Int, val DimY: Int, override val config: ISA) extends BareNoCBundle(config) {
-  val xHops: UInt = UInt(log2Ceil(DimX).W)
-  val yHops: UInt = UInt(log2Ceil(DimY).W)
+  // Signed hop counts: positive = forward (+X/+Y), negative = backward (-X/-Y).
+  // One extra bit beyond log2Ceil provides the sign while covering the full bidirectional range
+  // (e.g., DimX=4 → SInt(3.W) represents -4..+3, max bidirectional distance is ±2).
+  val xHops: SInt = SInt((log2Ceil(DimX) + 1).W)
+  val yHops: SInt = SInt((log2Ceil(DimY) + 1).W)
 }
 
 object NoCBundle {
@@ -75,29 +78,25 @@ object NoCBundle {
     bundle
   }
 
-  /** Create a new packet from the original with the xHops decremented
-    *
-    * @param orig
-    *   original packet
-    * @return
+  /** Create a new packet from the original with xHops moved one step toward zero.
+    * Positive xHops (eastbound) decrement; negative xHops (westbound) increment.
+    * The routing logic picks the correct output port (xOutput or xNegOutput) based
+    * on the sign; this function only adjusts the counter regardless of direction.
     */
   def passX(orig: NoCBundle): NoCBundle = {
     val passed = Wire(new NoCBundle(orig.DimX, orig.DimY, orig.config))
     passed       := orig
-    passed.xHops := orig.xHops - 1.U
+    passed.xHops := Mux(orig.xHops > 0.S, orig.xHops - 1.S, orig.xHops + 1.S)
     passed
   }
 
-  /** Create a new packet from the original with yHops decremented
-    *
-    * @param orig
-    *   original packet
-    * @return
+  /** Create a new packet from the original with yHops moved one step toward zero.
+    * Positive yHops (northbound) decrement; negative yHops (southbound) increment.
     */
   def passY(orig: NoCBundle): NoCBundle = {
     val passed = Wire(new NoCBundle(orig.DimX, orig.DimY, orig.config))
     passed       := orig
-    passed.yHops := orig.yHops - 1.U
+    passed.yHops := Mux(orig.yHops > 0.S, orig.yHops - 1.S, orig.yHops + 1.S)
     passed
   }
 
@@ -126,123 +125,157 @@ object NoCBundle {
   * @param config
   */
 class SwitchInterface(DimX: Int, DimY: Int, config: ISA) extends Bundle {
-  // input from x direction
-  val xInput: NoCBundle = Input(NoCBundle(DimX, DimY, config))
-  // input from y direction
-  val yInput: NoCBundle = Input(NoCBundle(DimX, DimY, config))
+  // Eastbound channel: packets traveling in the +X direction
+  val xInput: NoCBundle  = Input(NoCBundle(DimX, DimY, config))
+  val xOutput: NoCBundle = Output(NoCBundle(DimX, DimY, config))
+
+  // Westbound channel: packets traveling in the -X direction
+  val xNegInput: NoCBundle  = Input(NoCBundle(DimX, DimY, config))
+  val xNegOutput: NoCBundle = Output(NoCBundle(DimX, DimY, config))
+
+  // Northbound channel: packets traveling in the +Y direction.
+  // yOutput is also used for terminal delivery to the local PE (terminal == true).
+  val yInput: NoCBundle  = Input(NoCBundle(DimX, DimY, config))
+  val yOutput: NoCBundle = Output(NoCBundle(DimX, DimY, config))
+
+  // Southbound channel: packets traveling in the -Y direction
+  val yNegInput: NoCBundle  = Input(NoCBundle(DimX, DimY, config))
+  val yNegOutput: NoCBundle = Output(NoCBundle(DimX, DimY, config))
+
   // input from the local PE
   val lInput: NoCBundle = Input(NoCBundle(DimX, DimY, config))
 
-  // output to the PE, defining whether the PE is the destination,
-  // note that it should always be the case:
-  // 1. that terminal == true -> yOutput.valid == false
-  // 2. yOutput.valid == true -> terminal == false
+  // terminal: true when yOutput carries a packet destined for the local PE
   val terminal: Bool = Output(Bool())
-
-  // output in the x direction
-  val xOutput: NoCBundle = Output(NoCBundle(DimX, DimY, config))
-  // output in the y direction
-  val yOutput: NoCBundle = Output(NoCBundle(DimX, DimY, config))
-
 }
 
-/** A one-dimensional NoC switch that can be used to create a torus network on
-  * chip. The switch does not provide any "flow control" mechanisms and is
-  * supposed. The routing is a variant of dimension ordered routing in which
-  * packets first flow in the X direction and the Y. Packets carry a tuple (x,
-  * y) that is decremented in the respective dimensions when a hop is traversed.
-  * When `x == 0 && y == 0`, the packet has reached its destination, such a
-  * packet is again routed through the Y dimension but is invalidated. The
-  * `terminal` signal in the `SwitchInterface` determines that the packet has
-  * reached its destination and the PE should consume this packet immediately.
+/** Bidirectional NoC switch for a 2D torus.
   *
-  * There 7 possible routes each packet can take depending with the given
-  * priorities: X -> X, X -> Y, X -> L (terminal) > Y -> Y, Y -> L (terminal) >
-  * L -> X, L -> Y
+  * Routing is dimension-ordered: X dimension first, then Y. Hop fields in NoCBundle are
+  * signed (positive = forward/+X/+Y, negative = backward/-X/-Y); each switch moves the
+  * count one step toward zero and forwards the packet on the correct directional channel.
+  * When both hop fields reach zero the packet is delivered to the local PE via yOutput
+  * (terminal == true) regardless of the direction it arrived from.
   *
-  * The router can route at most two packets in a single cycle given the source
-  * and destination as long as the destinations are distinct. Excess packets are
-  * dropped respecting the priority of paths. For instance, in a single cycle we
-  * can have both X -> X, Y -> Y. In this case any packet originating from L is
-  * dropped (e.g., L -> Y). Another example is X->Y, L->X, in this case any
-  * packet on Y is dropped.
+  * Five input ports — xInput (eastbound), xNegInput (westbound), yInput (northbound),
+  * yNegInput (southbound), lInput (local) — and four output channels plus terminal:
+  *   xOutput    : eastbound (+X) in-transit packets
+  *   xNegOutput : westbound (-X) in-transit packets
+  *   yOutput    : northbound (+Y) in-transit packets AND terminal delivery to the PE
+  *   yNegOutput : southbound (-Y) in-transit packets
+  *
+  * Priority (highest wins, implemented by writing lower-priority inputs first in Chisel):
+  *   xInput > xNegInput > yInput > yNegInput > lInput
+  *
+  * At most two packets can be routed per cycle when their output ports are distinct (e.g.
+  * xInput continuing east while lInput turns north). Excess packets sharing an output are
+  * dropped respecting the priority order.
   *
   * @param DimX
   * @param DimY
   * @param config
+  * @param n_hop pipeline register depth per hop (1 = registered once, 2 = two stages, …)
   */
+object Switch {
+  // Toggle the simulation-only packet-drop detector with -Dmanticore.debug_drops=true.
+  val DEBUG_DROPS: Boolean =
+    sys.props.get("manticore.debug_drops").exists(v => v == "true" || v == "1")
+}
+
 class Switch(DimX: Int, DimY: Int, config: ISA, n_hop: Int) extends Module {
   val io = IO(new SwitchInterface(DimX, DimY, config))
 
   val empty = Wire(NoCBundle(DimX, DimY, config))
 
-  val x_reg: NoCBundle   = Reg(NoCBundle(DimX, DimY, config))
-  val y_reg: NoCBundle   = Reg(NoCBundle(DimX, DimY, config))
-  val terminal_reg: Bool = Reg(Bool())
+  // One register per output channel; all default to empty/false each cycle.
+  val x_reg: NoCBundle     = Reg(NoCBundle(DimX, DimY, config))
+  val x_neg_reg: NoCBundle = Reg(NoCBundle(DimX, DimY, config))
+  val y_reg: NoCBundle     = Reg(NoCBundle(DimX, DimY, config))
+  val y_neg_reg: NoCBundle = Reg(NoCBundle(DimX, DimY, config))
+  val terminal_reg: Bool   = Reg(Bool())
 
-  // default values of the outputs
   x_reg        := empty
+  x_neg_reg    := empty
   y_reg        := empty
+  y_neg_reg    := empty
   terminal_reg := false.B
 
-  /** Dimension-ordered routing, first route X, then Y, and finally L (local),
-    * this translate to writing the code in the "opposite way", i.e., first we
-    * try to route L either to the xOutput or yOutput, then we route yInput to
-    * the yOutput and finally we route xInput to the xOutput or the yOutput
-    */
+  // Priority: lInput (lowest) — written first so higher-priority inputs can overwrite.
 
   when(io.lInput.valid) {
-    when(io.lInput.xHops === 0.U) {
-      // route the local message to the yOutput, drop if self message
-      when(io.lInput.yHops =/= 0.U) {
-        y_reg := NoCBundle.passY(io.lInput)
-        // this second check can be avoided because self messages should be
-        // generated by a compiler anyways. It's kept here for documentation
-        // though
-      } // otherwise is implicit, because default value is of io.yOutput is set to empty
-    } otherwise {
-      // route the local message to the xOutput
-      x_reg := NoCBundle.passX(io.lInput)
+    when(io.lInput.xHops > 0.S) {
+      x_reg := NoCBundle.passX(io.lInput)           // go east
+    }.elsewhen(io.lInput.xHops < 0.S) {
+      x_neg_reg := NoCBundle.passX(io.lInput)        // go west
+    }.elsewhen(io.lInput.yHops > 0.S) {
+      y_reg := NoCBundle.passY(io.lInput)            // go north (xHops == 0)
+    }.elsewhen(io.lInput.yHops < 0.S) {
+      y_neg_reg := NoCBundle.passY(io.lInput)        // go south (xHops == 0)
     }
+    // both == 0: self-message, drop silently (compiler must not generate these)
   }
 
-  when(io.yInput.valid) {
-    when(io.yInput.yHops === 0.U) {
-      // reached the destination, route to the yOutput as a terminal message
-      y_reg        := NoCBundle.terminal(io.yInput)
-      terminal_reg := true.B
-    } otherwise {
-      // route to the yOutput
-      y_reg        := NoCBundle.passY(io.yInput)
+  // yNegInput: southbound in-transit or terminal delivery
+  when(io.yNegInput.valid) {
+    when(io.yNegInput.yHops < 0.S) {
+      y_neg_reg    := NoCBundle.passY(io.yNegInput)  // continue south
       terminal_reg := false.B
+    }.otherwise {
+      // yHops reached 0: terminal delivery via yOutput regardless of arrival direction
+      y_reg        := NoCBundle.terminal(io.yNegInput)
+      terminal_reg := true.B
     }
   }
+
+  // yInput: northbound in-transit or terminal delivery
+  when(io.yInput.valid) {
+    when(io.yInput.yHops > 0.S) {
+      y_reg        := NoCBundle.passY(io.yInput)     // continue north
+      terminal_reg := false.B
+    }.otherwise {
+      y_reg        := NoCBundle.terminal(io.yInput)  // terminal
+      terminal_reg := true.B
+    }
+  }
+
+  // xNegInput: westbound in-transit; transitions to Y when X is done
+  when(io.xNegInput.valid) {
+    when(io.xNegInput.xHops < 0.S) {
+      x_neg_reg := NoCBundle.passX(io.xNegInput)     // continue west
+    }.elsewhen(io.xNegInput.yHops > 0.S) {
+      y_reg        := NoCBundle.passY(io.xNegInput)  // turn north
+      terminal_reg := false.B
+    }.elsewhen(io.xNegInput.yHops < 0.S) {
+      y_neg_reg    := NoCBundle.passY(io.xNegInput)  // turn south
+      terminal_reg := false.B
+    }.otherwise {
+      y_reg        := NoCBundle.terminal(io.xNegInput) // terminal
+      terminal_reg := true.B
+    }
+  }
+
+  // xInput: eastbound in-transit (highest priority — written last, wins all conflicts)
   when(io.xInput.valid) {
-    when(io.xInput.xHops === 0.U) {
-      when(io.xInput.yHops === 0.U) {
-        // the message from the X port has reached its destination and should be routed to the local PE which receives
-        // the message from the yOutput port
-        y_reg        := NoCBundle.terminal(io.xInput)
-        terminal_reg := true.B
-        // invalidate the message on xOutput port
-      } otherwise {
-        // route the message to the yOutput
-        y_reg        := NoCBundle.passY(io.xInput)
-        terminal_reg := false.B
-        // invalidate the message on the xOutput
-      }
-    } otherwise {
-      // route the message to the xOutput
-      x_reg := NoCBundle.passX(io.xInput)
-
+    when(io.xInput.xHops > 0.S) {
+      x_reg := NoCBundle.passX(io.xInput)            // continue east
+    }.elsewhen(io.xInput.yHops > 0.S) {
+      y_reg        := NoCBundle.passY(io.xInput)     // turn north
+      terminal_reg := false.B
+    }.elsewhen(io.xInput.yHops < 0.S) {
+      y_neg_reg    := NoCBundle.passY(io.xInput)     // turn south
+      terminal_reg := false.B
+    }.otherwise {
+      y_reg        := NoCBundle.terminal(io.xInput)  // terminal
+      terminal_reg := true.B
     }
   }
 
-  // We subtract 1 as x_reg/y_reg/terminal_reg count as 1 hop.
-  io.xOutput  := Helpers.InlinePipeWithStyle(x_reg, n_hop - 1)
-  io.yOutput  := Helpers.InlinePipeWithStyle(y_reg, n_hop - 1)
-  io.terminal := Helpers.InlinePipeWithStyle(terminal_reg, n_hop - 1)
-
+  // We subtract 1 as x_reg/y_reg/terminal_reg each count as 1 hop.
+  io.xOutput    := Helpers.InlinePipeWithStyle(x_reg, n_hop - 1)
+  io.xNegOutput := Helpers.InlinePipeWithStyle(x_neg_reg, n_hop - 1)
+  io.yOutput    := Helpers.InlinePipeWithStyle(y_reg, n_hop - 1)
+  io.yNegOutput := Helpers.InlinePipeWithStyle(y_neg_reg, n_hop - 1)
+  io.terminal   := Helpers.InlinePipeWithStyle(terminal_reg, n_hop - 1)
 }
 
 class SwitchPacketInspector(
@@ -268,24 +301,24 @@ class SwitchPacketInspector(
         (clock_counter +: data): _*
       )
   }
-  //report any packet loss that occurs
-  when(io.lInput.valid && io.lInput.xHops === 0.U && io.lInput.yHops === 0.U) {
+  // report any packet loss that occurs (hop comparisons use signed literals)
+  when(io.lInput.valid && io.lInput.xHops === 0.S && io.lInput.yHops === 0.S) {
     error("self packet detected!")
   }
 
-  // when X causes Y or L to be dropped
-  when(io.xInput.valid && io.xInput.xHops === 0.U) {
+  // when eastbound X causes Y or L to be dropped
+  when(io.xInput.valid && io.xInput.xHops === 0.S) {
     when(io.yInput.valid) {
       error("dropping Y because of X")
     }
-    when(io.lInput.valid && io.lInput.xHops === 0.U) {
+    when(io.lInput.valid && io.lInput.xHops === 0.S) {
       error("dropping L because of X")
     }
   }
 
-  // when Y causes L to be dropped
-  when(io.yInput.valid && io.yInput.yHops === 0.U) {
-    when(io.lInput.valid && io.lInput.xHops === 0.U) {
+  // when northbound Y causes L to be dropped
+  when(io.yInput.valid && io.yInput.yHops === 0.S) {
+    when(io.lInput.valid && io.lInput.xHops === 0.S) {
       error("dropping local input")
     }
   }

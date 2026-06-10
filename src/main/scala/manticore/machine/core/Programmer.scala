@@ -99,8 +99,9 @@ class Programmer(config: ISA, DimX: Int, DimY: Int) extends Module {
     y_counter.io.en := x_counter.io.wrap
   }
 
-  val dest_x: UInt = RegInit(0.U(log2Up(DimX).W))
-  val dest_y: UInt = RegInit(0.U(log2Up(DimY).W))
+  // +1 for sign bit: must represent signed hop counts in [-floor(DimX/2), floor(DimX/2)]
+  val dest_x: UInt = RegInit(0.U((log2Up(DimX) + 1).W))
+  val dest_y: UInt = RegInit(0.U((log2Up(DimY) + 1).W))
 
   // register memory response for better timing closure
   val mem_resp_done = Reg(Bool())
@@ -120,8 +121,10 @@ class Programmer(config: ISA, DimX: Int, DimY: Int) extends Module {
   packet_out.valid := false.B
 
   packet_out.data    := mem_rdata
-  packet_out.xHops   := dest_x
-  packet_out.yHops   := dest_y
+  // dest_x/dest_y are signed hop counts loaded from the binary (written by the compiler).
+  // The binary encodes 2's complement 8-bit values; asSInt reinterprets the bits correctly.
+  packet_out.xHops   := dest_x.asSInt
+  packet_out.yHops   := dest_y.asSInt
   packet_out.address := 0.U
 
   io.memory_backend.start := false.B
@@ -231,8 +234,9 @@ class Programmer(config: ISA, DimX: Int, DimY: Int) extends Module {
     }
     is(Phase.StreamCountDown) {
       xyCountUp()
-      packet_out.xHops := (DimX - 1).U - x_counter.io.value
-      packet_out.yHops := (DimY - 1).U - y_counter.io.value
+      // countdown hops are distances from (0,0), always non-negative → zero-extend to SInt
+      packet_out.xHops := ((DimX - 1).U - x_counter.io.value).zext
+      packet_out.yHops := ((DimY - 1).U - y_counter.io.value).zext
       packet_out.valid := true.B
       packet_out.data  := delay_value
 //      delay_value := delay_value - 1.U

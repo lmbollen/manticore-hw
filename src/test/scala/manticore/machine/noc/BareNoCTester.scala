@@ -75,26 +75,27 @@ class BareNoCTester extends AnyFlatSpec with ChiselScalatestTester with Matchers
 
       val source = Position(rdgen.nextInt(DimX), rdgen.nextInt(DimY))
       val packet: NoCBundle = rdgen.nextInt(3) match {
+        // hops are signed (SInt) now; this test exercises forward (+X/+Y) routing only
         case 0 => new NoCBundle(DimX, DimY, config).Lit(
           _.data -> SwitchTestUtils.genData(config)(rdgen),
           _.address -> SwitchTestUtils.genAddress(config)(rdgen),
           _.valid -> true.B,
-          _.xHops -> (rdgen.nextInt(DimX - 1) + 1).U,
-          _.yHops -> (rdgen.nextInt(DimY - 1) + 1).U
+          _.xHops -> (rdgen.nextInt(DimX - 1) + 1).S,
+          _.yHops -> (rdgen.nextInt(DimY - 1) + 1).S
         )
         case 1 => new NoCBundle(DimX, DimY, config).Lit(
           _.data -> SwitchTestUtils.genData(config)(rdgen),
           _.address -> SwitchTestUtils.genAddress(config)(rdgen),
           _.valid -> true.B,
-          _.xHops -> (rdgen.nextInt(DimX - 1) + 1).U,
-          _.yHops -> 0.U
+          _.xHops -> (rdgen.nextInt(DimX - 1) + 1).S,
+          _.yHops -> 0.S
         )
         case 2 => new NoCBundle(DimX, DimY, config).Lit(
           _.data -> SwitchTestUtils.genData(config)(rdgen),
           _.address -> SwitchTestUtils.genAddress(config)(rdgen),
           _.valid -> true.B,
-          _.xHops -> 0.U,
-          _.yHops -> (rdgen.nextInt(DimY - 1) + 1).U
+          _.xHops -> 0.S,
+          _.yHops -> (rdgen.nextInt(DimY - 1) + 1).S
         )
         case _ => fail("Invalid random number!")
       }
@@ -121,8 +122,8 @@ class BareNoCTester extends AnyFlatSpec with ChiselScalatestTester with Matchers
             _.data -> 0.U,
             _.address -> 0.U,
             _.valid -> false.B,
-            _.xHops -> 0.U,
-            _.yHops -> 0.U
+            _.xHops -> 0.S,
+            _.yHops -> 0.S
           ))
         waitResponse(expected)
         TestCase(source, target)

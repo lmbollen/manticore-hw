@@ -143,8 +143,8 @@ class ProgrammerTester
             println("Validated the instruction stream")
           } else {
             if (dut.io.packet_out.valid.peek().litToBoolean) {
-              dut.io.packet_out.xHops.expect(expected_stream.head._2.U)
-              dut.io.packet_out.yHops.expect(expected_stream.head._3.U)
+              dut.io.packet_out.xHops.expect(expected_stream.head._2.S)
+              dut.io.packet_out.yHops.expect(expected_stream.head._3.S)
               dut.io.packet_out.data.expect(expected_stream.head._1.U)
               // println(s"Validated ${expected_stream.head}")
               dut.clock.step()
