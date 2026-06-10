@@ -123,6 +123,32 @@ design clock always costs exactly `L` Manticore cycles, and the NoC schedule can
 every instruction's issue cycle. This determinism is the foundation the whole
 architecture (NoC reservations, Recv placement, multi-chip latency modeling) rests on.
 
+### Sleep and the receive mechanism (`Processor.scala`)
+
+One `countdown_timer` register drives all phases: boot countdown → execution
+(`countdown := body+epilogue`) ⇄ sleep (`countdown := sleep_length`). On entering sleep
+the fetch unit is disabled (PC resets to 0, NOPs issue) but the core's **clock keeps
+running** — its switch keeps routing. Since every core's `N_i + sleep_i` equals the same
+period `L`, all cores wake on the same cycle: synchronization is pure arithmetic, with
+no barrier — valid only because execution is branch-free (and why a boot-time stagger
+persists forever).
+
+**Receives are self-modifying code.** There is no NoC write port into the register
+file. During execution, an arriving packet `(register, value)` is assembled into a
+`SET register, value` instruction and written into **instruction memory** at
+`program_pointer`, which starts at `program_body_length` (reset on every wake) and
+increments per arrival — the epilogue region is a landing zone, filled in arrival
+order. Received values reach the register file when the PC later sweeps the epilogue
+and executes those `SET`s through the ordinary pipeline.
+
+The scheduler guarantees the timing: `epilogue_length` (in the boot stream) is the
+number of expected receives; the virtual `Recv` instructions are placed at their
+modeled arrival cycles with NOP padding, so the core is still awake until the last
+expected packet has landed — sleep begins only afterwards (the sleep state has no
+packet handling; a packet arriving during sleep would be lost). A value sent in
+virtual cycle N is typically consumed in vcycle N+1 — registered, loop-carried
+communication, matching the `_curr/_next` semantics of the simulated design.
+
 ---
 
 ## 2. The compiler IR — one grammar, two levels
