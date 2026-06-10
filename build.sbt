@@ -13,6 +13,7 @@ lazy val root = (project in file("."))
       "com.github.scopt" %% "scopt" % "4.0.1", // cli arg parsing
       "com.google.ortools" % "ortools-java" % "9.3.10497", // for constraint solving
       "org.scalatest" %% "scalatest" % "3.2.9" % Test, // scala test
+      "org.scalatestplus" %% "scalacheck-1-15" % "3.2.9.0" % Test, // property tests
       "edu.berkeley.cs" %% "chiseltest" % "0.5.1" % Test
     ),
     scalacOptions ++= Seq(
