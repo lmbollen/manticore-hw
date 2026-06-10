@@ -97,9 +97,14 @@ differences and must now span the full grid.
 The schedule's correctness rests on `manhattan × nHops` with a **single `nHops`**. Inter-chip links
 (off-chip GTH/GTY SerDes + board traces) have **higher and different** latency than an on-chip hop.
 So:
-- `nHops` can no longer be one constant. `HardwareConfig.xHops/yHops/manhattan` must be rewritten to
-  **sum per-hop latencies along the route**, charging each inter-chip crossing its real cost
-  (intra-chip hop = 1; inter-chip hop = K cycles).
+- `nHops` can no longer be one constant. **(IMPLEMENTED:** `masm --hop-latencies <file.csv>`
+  loads per-directed-link latencies (`src_x,src_y,dir,latency`, dir ∈ east|west|north|south,
+  unlisted links = 1); `NetworkOnChip.Path` advances each hop by its link's latency and
+  `manhattan` returns route travel-time, so Recv placement / link reservations / scheduling
+  charge each inter-chip crossing its real cost. Packet addressing is untouched — only the
+  travel-time model.**)** Verified: charged links shift `expectedRecv` in `transactions.csv`
+  by exactly latency−1; the placed interpreter still reproduces the MIPS32 golden with the
+  padded schedule; uncharged compiles remain functionally identical (RTL co-sim exact golden).
 - The inter-chip link **must be fixed-latency and deterministic** — exactly like the existing
   `slrCrossingLatency` pipeline, scaled up. An elastic/async SerDes (variable-latency FIFO) **breaks
   static scheduling** and is not usable as-is; the link needs a phase-aligned, fixed-latency
