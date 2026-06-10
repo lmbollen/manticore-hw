@@ -15,26 +15,25 @@ import org.scalatestplus.scalacheck.ScalaCheckPropertyChecks
 
 /** Property tests (ScalaCheck) for the STATIC LATENCY contract of the TDM components.
   *
-  * Contract: for a configuration (nBanks, cyclesPerSlot N, transceiver latency D), a
-  * packet injected on bank b during cycle t is delivered on the receiver's output
-  * bank b during EXACTLY
+  * Contract (constant-latency release): for a configuration (nBanks, cyclesPerSlot N,
+  * transceiver latency D, configured total latency T >= nBanks*N + D + 2), a packet
+  * injected on bank b during cycle t is presented on the receiver's output bank b
+  * during EXACTLY
   *
-  *     deliver(t, b) = nextSlotStart_b(t + 1) + D + 1
-  *     where bank b's slot starts are the cycles s ≡ b*N (mod nBanks*N)
+  *     deliver(t) = t + T - 1        (the destination switch register adds the final +1)
   *
-  * (+1 capture register, the free-running slot wait, D wire cycles, +1 demux output
-  * register). The latency is a pure function of the arrival cycle's phase — never of
-  * data or other traffic — which is what lets the compiler schedule across TDM'd
-  * chip-to-chip links statically.
+  * for EVERY bank and EVERY arrival phase: the frame carries its slot-wait age and the
+  * demux holds each packet until the total reaches T. A constant latency is exactly
+  * what the compiler's per-link model (--hop-latencies) charges, and it preserves the
+  * scheduler's NoC collision guarantees (nothing ever appears early).
   *
-  * Property 1 sweeps randomly generated configurations *of multiple sizes* with
-  * random (bank, phase) injection sequences — including repeated phases, which
-  * checks run-to-run repeatability — and requires exact delivery cycles.
-  * Property 2 injects a random SUBSET of banks in the same cycle and requires each
-  * to meet its own contract exactly (sharing the single wire must not perturb
-  * timing — independence under contention).
+  * Property 1 sweeps randomly generated configurations *of multiple sizes* with random
+  * (bank, phase) injection sequences — duplicates included (repeatability).
+  * Property 2 injects a random SUBSET of banks in the same cycle: all must deliver in
+  * the SAME cycle (t + T - 1), the strongest form of timing independence under
+  * contention for the single wire.
   */
-class TdmLatencyHarness(val nBanks: Int, val cyclesPerSlot: Int, val D: Int, config: ISA)
+class TdmLatencyHarness(val nBanks: Int, val cyclesPerSlot: Int, val D: Int, val T: Int, config: ISA)
     extends Module {
   val DimX = 8; val DimY = 4 // packet payload dims (irrelevant to the TDM logic)
   val io = IO(new Bundle {
@@ -44,7 +43,7 @@ class TdmLatencyHarness(val nBanks: Int, val cyclesPerSlot: Int, val D: Int, con
     val cyc      = Output(UInt(32.W))
   })
   val mux   = Module(new TdmLinkMux(nBanks, cyclesPerSlot, DimX, DimY, config))
-  val demux = Module(new TdmLinkDemux(nBanks, DimX, DimY, config))
+  val demux = Module(new TdmLinkDemux(nBanks, cyclesPerSlot, D, T, DimX, DimY, config))
   mux.io.in          := io.in
   mux.io.connected   := true.B
   demux.io.connected := true.B
@@ -67,20 +66,19 @@ class TdmStaticLatencyTester
   implicit override val generatorDrivenConfig: PropertyCheckConfiguration =
     PropertyCheckConfiguration(minSuccessful = 12, workers = 1)
 
-  case class Cfg(nBanks: Int, n: Int, d: Int)
+  case class Cfg(nBanks: Int, n: Int, d: Int, slack: Int) {
+    def period = nBanks * n
+    def T      = period + d + 2 + slack // configured constant seam latency
+  }
   val cfgGen: Gen[Cfg] = for {
     nBanks <- Gen.choose(2, 10)
     n      <- Gen.choose(1, 3)
     d      <- Gen.choose(1, 8)
-  } yield Cfg(nBanks, n, d)
+    slack  <- Gen.choose(0, 4)
+  } yield Cfg(nBanks, n, d, slack)
 
-  /** the contract oracle */
-  def predictedDelivery(t: BigInt, b: Int, cfg: Cfg): BigInt = {
-    val period = BigInt(cfg.nBanks * cfg.n)
-    val target = BigInt(b * cfg.n)
-    val u      = t + 1
-    u + ((target - u) % period + period) % period + cfg.d + 1
-  }
+  /** the constant-latency contract oracle: presentation cycle for injection at t */
+  def predictedDelivery(t: BigInt, b: Int, cfg: Cfg): BigInt = t + cfg.T - 1
 
   def emptyPkt(dut: TdmLatencyHarness): NoCBundle =
     NoCBundle(dut.DimX, dut.DimY, config).Lit(
@@ -116,7 +114,7 @@ class TdmStaticLatencyTester
     } yield (cfg, cases)
 
     forAll(caseGen) { case (cfg, cases) =>
-      test(new TdmLatencyHarness(cfg.nBanks, cfg.n, cfg.d, config)) { dut =>
+      test(new TdmLatencyHarness(cfg.nBanks, cfg.n, cfg.d, cfg.T, config)) { dut =>
         (0 until cfg.nBanks).foreach(i => dut.io.in(i).poke(emptyPkt(dut)))
         dut.clock.step()
         val period = cfg.nBanks * cfg.n
@@ -147,7 +145,7 @@ class TdmStaticLatencyTester
     } yield (cfg, banks.toSeq.sorted, phase)
 
     forAll(simGen) { case (cfg, banks, phase) =>
-      test(new TdmLatencyHarness(cfg.nBanks, cfg.n, cfg.d, config)) { dut =>
+      test(new TdmLatencyHarness(cfg.nBanks, cfg.n, cfg.d, cfg.T, config)) { dut =>
         (0 until cfg.nBanks).foreach(i => dut.io.in(i).poke(emptyPkt(dut)))
         dut.clock.step()
         val period = cfg.nBanks * cfg.n

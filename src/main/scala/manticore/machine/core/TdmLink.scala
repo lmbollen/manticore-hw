@@ -28,17 +28,20 @@ import manticore.machine.ISA
   * For Z > 1 transceivers, instantiate one mux/demux pair per transceiver over a
   * partition of the logical links.
   */
-class TdmFrame(val DimX: Int, val DimY: Int, val config: ISA, val nBanks: Int) extends Bundle {
-  val valid  = Bool()                       // frame carries a packet
-  val tag    = UInt(log2Ceil(nBanks).W)     // which logical link (bank) it belongs to
+class TdmFrame(val DimX: Int, val DimY: Int, val config: ISA, val nBanks: Int, val cyclesPerSlot: Int = 1)
+    extends Bundle {
+  val valid  = Bool()                                          // frame carries a packet
+  val tag    = UInt(log2Ceil(nBanks).W)                        // which logical link (bank) it belongs to
+  val age    = UInt(log2Ceil(nBanks * cyclesPerSlot + 2).W)    // cycles spent waiting in the input bank
   val packet = new NoCBundle(DimX, DimY, config)
 }
 
 object TdmFrame {
-  def empty(DimX: Int, DimY: Int, config: ISA, nBanks: Int): TdmFrame = {
-    val f = Wire(new TdmFrame(DimX, DimY, config, nBanks))
+  def empty(DimX: Int, DimY: Int, config: ISA, nBanks: Int, cyclesPerSlot: Int = 1): TdmFrame = {
+    val f = Wire(new TdmFrame(DimX, DimY, config, nBanks, cyclesPerSlot))
     f.valid  := false.B
     f.tag    := 0.U
+    f.age    := 0.U
     f.packet := NoCBundle.empty(DimX, DimY, config)
     f
   }
@@ -53,12 +56,15 @@ class TdmLinkMux(nBanks: Int, cyclesPerSlot: Int, DimX: Int, DimY: Int, config: 
   val io = IO(new Bundle {
     val in        = Input(Vec(nBanks, new NoCBundle(DimX, DimY, config)))
     val connected = Input(Bool()) // transceiver attached & link up
-    val tx        = Output(new TdmFrame(DimX, DimY, config, nBanks))
+    val tx        = Output(new TdmFrame(DimX, DimY, config, nBanks, cyclesPerSlot))
     val overflow  = Output(Bool()) // a bank was overwritten before its slot drained it
   })
 
   val banks     = Reg(Vec(nBanks, new NoCBundle(DimX, DimY, config)))
   val bankValid = RegInit(VecInit(Seq.fill(nBanks)(false.B)))
+  // cycles each waiting packet has spent in its bank — transmitted as the frame's
+  // `age`, so the receiver can release every packet at a CONSTANT total latency.
+  val bankAge = Reg(Vec(nBanks, io.tx.age.cloneType))
 
   // free-running rotation: slot -> bank index, sub counts cycles within the slot
   val slot = RegInit(0.U(log2Ceil(nBanks).W))
@@ -71,10 +77,16 @@ class TdmLinkMux(nBanks: Int, cyclesPerSlot: Int, DimX: Int, DimY: Int, config: 
     sub := sub + 1.U
   }
 
+  // age all waiting banks
+  for (i <- 0 until nBanks) {
+    when(bankValid(i)) { bankAge(i) := bankAge(i) + 1.U }
+  }
+
   // transmit at the first cycle of a bank's slot (reads the pre-capture register value)
   val txValid = io.connected && slotStart && bankValid(slot)
   io.tx.valid  := txValid
   io.tx.tag    := slot
+  io.tx.age    := bankAge(slot)
   io.tx.packet := banks(slot)
   when(txValid) { bankValid(slot) := false.B }
 
@@ -85,6 +97,7 @@ class TdmLinkMux(nBanks: Int, cyclesPerSlot: Int, DimX: Int, DimY: Int, config: 
     when(io.in(i).valid) {
       banks(i)     := io.in(i)
       bankValid(i) := true.B
+      bankAge(i)   := 0.U
       when(bankValid(i) && !(txValid && slot === i.U)) {
         overflowNow := true.B // previous packet still waiting -> schedule oversubscribed the link
       }
@@ -93,26 +106,75 @@ class TdmLinkMux(nBanks: Int, cyclesPerSlot: Int, DimX: Int, DimY: Int, config: 
   io.overflow := overflowNow
 }
 
-/** Ingress: route an arriving frame into the output bank named by its tag and present
-  * it to the array for exactly one cycle (the NoC treats every valid cycle as a new
-  * packet, so banks pulse rather than hold).
+/** Ingress: route an arriving frame into the output bank named by its tag, then hold it
+  * until the packet's TOTAL latency (capture at the sender's input bank -> presentation
+  * here) reaches exactly `totalLatency` cycles, and present it for one cycle.
+  *
+  * The release uses the frame's `age` (slot wait at the sender): residual =
+  * totalLatency - age - wireLatency - constants. A CONSTANT per-crossing latency is what
+  * the compiler's per-link model (`--hop-latencies`) charges, and it preserves the
+  * scheduler's collision guarantees exactly: a packet that arrived early in the slot
+  * rotation simply rests in its output bank, never appearing in the NoC sooner than the
+  * schedule expects. Requires totalLatency >= the worst path
+  * (nBanks*cyclesPerSlot + wireLatency + fixed registers), checked at elaboration.
   */
-class TdmLinkDemux(nBanks: Int, DimX: Int, DimY: Int, config: ISA) extends Module {
+class TdmLinkDemux(
+    nBanks: Int,
+    cyclesPerSlot: Int,
+    wireLatency: Int,
+    totalLatency: Int,
+    DimX: Int,
+    DimY: Int,
+    config: ISA
+) extends Module {
   require(nBanks >= 2)
+  // Timeline for a packet captured at the sender during cycle t:
+  //   transmit at slot start s = t + 1 + age          (age = slot wait, 0..period-1)
+  //   frame at this demux during s + wireLatency
+  //   output bank holds it from  s + wireLatency + 1
+  //   presented (1-cycle pulse) at p = s + wireLatency + 1 + release
+  //   destination switch register occupied at p + 1
+  // Constant-latency contract: (p + 1) - t == totalLatency for EVERY packet, i.e.
+  //   release = totalLatency - 3 - wireLatency - age   (>= 0 must hold at age = period-1)
+  private val period = nBanks * cyclesPerSlot
+  require(
+    totalLatency >= period + wireLatency + 2,
+    s"totalLatency $totalLatency must cover the worst TDM path ${period + wireLatency + 2} " +
+      s"(capture + slot wait ${period - 1} + wire $wireLatency + bank + switch)"
+  )
   val io = IO(new Bundle {
-    val rx        = Input(new TdmFrame(DimX, DimY, config, nBanks))
+    val rx        = Input(new TdmFrame(DimX, DimY, config, nBanks, cyclesPerSlot))
     val connected = Input(Bool())
     val out       = Output(Vec(nBanks, new NoCBundle(DimX, DimY, config)))
+    val overflow  = Output(Bool()) // an output bank was overwritten before its release
   })
 
-  val outBanks = Reg(Vec(nBanks, new NoCBundle(DimX, DimY, config)))
+  val outBanks  = Reg(Vec(nBanks, new NoCBundle(DimX, DimY, config)))
+  val bankValid = RegInit(VecInit(Seq.fill(nBanks)(false.B)))
+  val release   = Reg(Vec(nBanks, UInt(log2Ceil(totalLatency + 2).W)))
+
   for (i <- 0 until nBanks) {
-    outBanks(i) := NoCBundle.empty(DimX, DimY, config) // default: 1-cycle pulse semantics
+    io.out(i) := NoCBundle.empty(DimX, DimY, config) // default: 1-cycle pulse semantics
+    when(bankValid(i)) {
+      when(release(i) === 0.U) {
+        io.out(i)    := outBanks(i)
+        bankValid(i) := false.B
+      } otherwise {
+        release(i) := release(i) - 1.U
+      }
+    }
   }
+
+  val overflowNow = WireDefault(false.B)
   when(io.rx.valid && io.connected) {
-    outBanks(io.rx.tag) := io.rx.packet
+    // a same-cycle overwrite of a bank presenting RIGHT NOW is fine (the present
+    // happens this cycle, the new content lands next); earlier overwrites lose a packet
+    when(bankValid(io.rx.tag) && !(release(io.rx.tag) === 0.U)) { overflowNow := true.B }
+    outBanks(io.rx.tag)  := io.rx.packet
+    bankValid(io.rx.tag) := true.B
+    release(io.rx.tag)   := (totalLatency - 3 - wireLatency).U - io.rx.age
   }
-  io.out := outBanks
+  io.overflow := overflowNow
 }
 
 /** One chip-edge bridge for an X-dimension torus boundary: serializes the boundary's
@@ -121,7 +183,15 @@ class TdmLinkDemux(nBanks: Int, DimX: Int, DimY: Int, config: ISA) extends Modul
   * Wire `tx`->neighbour `rx` (through the fixed-latency transceiver) and vice versa;
   * the bank index convention is symmetric so two identical bridges interoperate.
   */
-class TdmTorusBoundaryBridge(nLinks: Int, cyclesPerSlot: Int, DimX: Int, DimY: Int, config: ISA) extends Module {
+class TdmTorusBoundaryBridge(
+    nLinks: Int,
+    cyclesPerSlot: Int,
+    wireLatency: Int,  // the transceiver's fixed latency between tx and rx
+    totalLatency: Int, // CONSTANT register-to-register seam latency (== the --hop-latencies value)
+    DimX: Int,
+    DimY: Int,
+    config: ISA
+) extends Module {
   val nBanks = 2 * nLinks
   val io = IO(new Bundle {
     // array-facing (connect to BareNoC's xFwdOut/xBwdOut and xFwdIn/xBwdIn)
@@ -130,14 +200,14 @@ class TdmTorusBoundaryBridge(nLinks: Int, cyclesPerSlot: Int, DimX: Int, DimY: I
     val fwdIn  = Output(Vec(nLinks, new NoCBundle(DimX, DimY, config))) // chip ingress, fwd channel
     val bwdIn  = Output(Vec(nLinks, new NoCBundle(DimX, DimY, config))) // chip ingress, bwd channel
     // transceiver-facing
-    val tx        = Output(new TdmFrame(DimX, DimY, config, 2 * nLinks))
-    val rx        = Input(new TdmFrame(DimX, DimY, config, 2 * nLinks))
+    val tx        = Output(new TdmFrame(DimX, DimY, config, 2 * nLinks, cyclesPerSlot))
+    val rx        = Input(new TdmFrame(DimX, DimY, config, 2 * nLinks, cyclesPerSlot))
     val connected = Input(Bool())
     val overflow  = Output(Bool())
   })
 
   val mux   = Module(new TdmLinkMux(nBanks, cyclesPerSlot, DimX, DimY, config))
-  val demux = Module(new TdmLinkDemux(nBanks, DimX, DimY, config))
+  val demux = Module(new TdmLinkDemux(nBanks, cyclesPerSlot, wireLatency, totalLatency, DimX, DimY, config))
 
   for (i <- 0 until nLinks) {
     mux.io.in(i)          := io.fwdOut(i)
@@ -149,5 +219,5 @@ class TdmTorusBoundaryBridge(nLinks: Int, cyclesPerSlot: Int, DimX: Int, DimY: I
   demux.io.connected := io.connected
   io.tx       := mux.io.tx
   demux.io.rx := io.rx
-  io.overflow := mux.io.overflow
+  io.overflow := mux.io.overflow || demux.io.overflow
 }

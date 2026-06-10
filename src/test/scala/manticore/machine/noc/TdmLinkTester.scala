@@ -33,7 +33,8 @@ class TdmTwoChipHarness(val DimX: Int, val DimY: Int, config: ISA, val D: Int, v
   })
 
   val chips   = Seq.fill(2)(Module(new BareNoC(DimX, DimY, config, n_hop = 1, torusDimX = GX)))
-  val bridges = Seq.fill(2)(Module(new TdmTorusBoundaryBridge(DimY, cyclesPerSlot, GX, DimY, config)))
+  val T = period + D + 2 // constant seam latency (== the --hop-latencies value)
+  val bridges = Seq.fill(2)(Module(new TdmTorusBoundaryBridge(DimY, cyclesPerSlot, D, T, GX, DimY, config)))
 
   chips.zip(bridges).zipWithIndex.foreach { case ((c, b), i) =>
     c.io.extendX      := io.extend
@@ -105,13 +106,14 @@ class TdmLinkTester extends AnyFlatSpec with ChiselScalatestTester with Matchers
       dut.io.in(c)(x)(y).poke(emptyPkt)
 
   /** inject and require delivery exactly once at the right node with the right data;
-    * non-crossing transfers must have EXACT latency hops+1, seam-crossers a bounded
-    * latency (slot wait <= period, wire = D, bank registers). Returns problems. */
+    * non-crossing transfers must have EXACT latency hops+1; each seam crossing now
+    * costs EXACTLY dut.T (constant-latency release in the demux). Returns problems. */
   def sendAndCheck(dut: TdmTwoChipHarness, cs: Int, lx: Int, ly: Int, cd: Int, tx: Int, ty: Int,
                    xh: Int, yh: Int, k: Int, data: Int): Seq[String] = {
     val problems = scala.collection.mutable.ArrayBuffer.empty[String]
     val base     = math.abs(xh) + math.abs(yh) + 1
-    val bound    = base + k * (dut.period + dut.D + 3)
+    val exact    = base + k * (dut.T - 1) // each crossing replaces a 1-cycle hop with T
+    val bound    = exact
     allEmpty(dut)
     dut.io.in(cs)(lx)(ly).poke(mkPkt(data, xh, yh))
     dut.clock.step()
@@ -123,9 +125,8 @@ class TdmLinkTester extends AnyFlatSpec with ChiselScalatestTester with Matchers
           if (cc == cd && x == tx && y == ty) {
             val got = dut.io.out(cc)(x)(y).data.peek().litValue.toInt
             if (got != data) problems += s"(c$cs,$lx,$ly)->(c$cd,$tx,$ty) hops($xh,$yh): data $got != $data"
-            if (k == 0 && c != base) problems += s"(c$cs,$lx,$ly)->(c$cd,$tx,$ty): non-crossing latency $c != $base"
-            if (k > 0 && (c < base + dut.D || c > bound))
-              problems += s"(c$cs,$lx,$ly)->(c$cd,$tx,$ty) crossings=$k: latency $c outside [${base + dut.D}, $bound]"
+            if (c != exact)
+              problems += s"(c$cs,$lx,$ly)->(c$cd,$tx,$ty) crossings=$k: latency $c != $exact (constant contract)"
             arrived = true
           } else {
             problems += s"(c$cs,$lx,$ly)->(c$cd,$tx,$ty) hops($xh,$yh): MISROUTED to (c$cc,$x,$y)"
