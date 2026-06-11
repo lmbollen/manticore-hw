@@ -74,17 +74,34 @@ class ComputeArray(
     debug_enable: Boolean = false,
     enable_custom_alu: Boolean = true,
     prefix_path: String = ".",
-    n_hop: Int = 1
+    n_hop: Int = 1,
+    // Multi-chip: hop fields must span the GLOBAL torus while this chip's array stays
+    // dimx x dimy (0 = standalone, bundle dims == local dims). The X wrap then routes
+    // through a TorusBoundary that can hand the seam links to a neighbouring chip at
+    // runtime (extendX); the seams' latency/transport (TDM, transceivers) live OUTSIDE
+    // this module — the array is topology-agnostic.
+    torusDimX: Int = 0,
+    torusDimY: Int = 0
 ) extends Module {
+
+  val tX = if (torusDimX > 0) torusDimX else dimx
+  val tY = if (torusDimY > 0) torusDimY else dimy
+  require(tX >= dimx && tY >= dimy, "torus dims must be >= local array dims")
 
   val io = IO(new Bundle {
     val mem_access         = Flipped(CacheConfig.frontInterface())
-    val config_packet      = Input(new NoCBundle(dimx, dimy, ManticoreFullISA))
+    val config_packet      = Input(new NoCBundle(tX, tY, ManticoreFullISA))
     val config_enable      = Input(Bool())
     val exception_id       = Output(UInt(32.W))
     val exception_occurred = Output(Bool())
     val dynamic_cycle      = Output(Bool())
     val execution_active   = Output(Bool())
+    // X-dimension torus extension (runtime): false = wrap closed locally (standalone)
+    val extendX = Input(Bool())
+    val xFwdOut = Output(Vec(dimy, new NoCBundle(tX, tY, ManticoreFullISA)))
+    val xFwdIn  = Input(Vec(dimy, new NoCBundle(tX, tY, ManticoreFullISA)))
+    val xBwdOut = Output(Vec(dimy, new NoCBundle(tX, tY, ManticoreFullISA)))
+    val xBwdIn  = Input(Vec(dimy, new NoCBundle(tX, tY, ManticoreFullISA)))
     // val core_reset_done    = Output(Bool())
   })
 
@@ -117,8 +134,8 @@ class ComputeArray(
         Module(
           new ProcessorWithSendRecvPipe(
             config = core_conf,
-            DimX = dimx,
-            DimY = dimy,
+            DimX = tX, // hop fields span the global torus
+            DimY = tY,
             x = x,
             y = y,
             equations = equations,
@@ -133,7 +150,7 @@ class ComputeArray(
       core.suggestName(s"core_${x}_${y}")
 
       val switch = Module(
-        new Switch(dimx, dimy, core_conf, n_hop)
+        new Switch(tX, tY, core_conf, n_hop) // bundle dims = global torus; routing is relative
       )
       switch.suggestName(s"switch_${x}_${y}")
 
@@ -141,17 +158,31 @@ class ComputeArray(
     }
   }
 
+  // The X wrap links pass through a TorusBoundary: closed locally by default
+  // (standalone torus, identical to the old hard wrap), or handed to a neighbouring
+  // chip via the io.x* ports when extendX is set at runtime.
+  val xBoundary = Module(new TorusBoundary(dimy, tX, tY, ManticoreFullISA))
+  xBoundary.io.extend := io.extendX
+  Range(0, dimy).foreach { y =>
+    xBoundary.io.wrapFwdIn(y) := cores(dimx - 1)(y).switch.io.xOutput
+    xBoundary.io.wrapBwdIn(y) := cores(0)(y).switch.io.xNegOutput
+  }
+  io.xFwdOut := xBoundary.io.extFwdOut
+  xBoundary.io.extFwdIn := io.xFwdIn
+  io.xBwdOut := xBoundary.io.extBwdOut
+  xBoundary.io.extBwdIn := io.xBwdIn
+
   // connect the cores via switches
   Range(0, dimx).foreach { x =>
     Range(0, dimy).foreach { y =>
-      // Eastbound (+X): packet from x-1 enters this switch; wrap from dimx-1 to 0
+      // Eastbound (+X): packet from x-1 enters this switch; wrap via the boundary
       cores(x)(y).switch.io.xInput := {
-        if (x == 0) cores(dimx - 1)(y).switch.io.xOutput
+        if (x == 0) xBoundary.io.wrapFwdOut(y)
         else        cores(x - 1)(y).switch.io.xOutput
       }
-      // Westbound (-X): packet from x+1 enters this switch; wrap from 0 to dimx-1
+      // Westbound (-X): packet from x+1 enters this switch; wrap via the boundary
       cores(x)(y).switch.io.xNegInput := {
-        if (x == dimx - 1) cores(0)(y).switch.io.xNegOutput
+        if (x == dimx - 1) xBoundary.io.wrapBwdOut(y)
         else                cores(x + 1)(y).switch.io.xNegOutput
       }
       // Northbound (+Y): packet from y-1 enters this switch; wrap from dimy-1 to 0
@@ -233,10 +264,32 @@ class ManticoreFlatArray(
     debug_enable: Boolean = false,
     enable_custom_alu: Boolean = true,
     prefix_path: String = ".",
-    n_hop: Int = 1
+    n_hop: Int = 1,
+    // Multi-chip: global torus dims (0 = standalone). The local array is dimx x dimy;
+    // hop fields/Programmer span the global torus; the X seam links are exposed via
+    // the optional `xb` IO so the harness/system can attach TDM bridges + transceivers.
+    torusDimX: Int = 0,
+    torusDimY: Int = 0
 ) extends RawModule {
 
+  val tX = if (torusDimX > 0) torusDimX else dimx
+  val tY = if (torusDimY > 0) torusDimY else dimy
+  private val multiChip = torusDimX > 0 || torusDimY > 0
+
   val io = IO(new ManticoreFlatArrayInterface)
+
+  /** multi-chip boundary IO (present only when torus dims are set) */
+  class XBoundaryIO extends Bundle {
+    val extendX = Input(Bool())
+    val fwdOut  = Output(Vec(dimy, new NoCBundle(tX, tY, ManticoreFullISA)))
+    val fwdIn   = Input(Vec(dimy, new NoCBundle(tX, tY, ManticoreFullISA)))
+    val bwdOut  = Output(Vec(dimy, new NoCBundle(tX, tY, ManticoreFullISA)))
+    val bwdIn   = Input(Vec(dimy, new NoCBundle(tX, tY, ManticoreFullISA)))
+    // system-composition signals the harness needs to run a secondary (compute-only) chip
+    val softResetOut    = Output(Bool()) // controller's soft reset (drives the other chip's array)
+    val configEnableOut = Output(Bool()) // boot window (drives the TDM bridges' bypass)
+  }
+  val xb: Option[XBoundaryIO] = if (multiChip) Some(IO(new XBoundaryIO)) else None
 
   val controller = withClockAndReset(
     reset = io.reset,
@@ -259,7 +312,9 @@ class ManticoreFlatArray(
     reset = controller.io.soft_reset
   ) {
     Module(
-      new Programmer(ManticoreFullISA, dimx, dimy)
+      // the Programmer addresses the GLOBAL torus (its boot stream covers every core
+      // of the composed system; the countdown sweep spans all tX x tY positions)
+      new Programmer(ManticoreFullISA, tX, tY)
     )
   }
   controller.io.start         := io.start
@@ -294,7 +349,9 @@ class ManticoreFlatArray(
         debug_enable = debug_enable,
         enable_custom_alu = enable_custom_alu,
         prefix_path = prefix_path,
-        n_hop = n_hop
+        n_hop = n_hop,
+        torusDimX = torusDimX,
+        torusDimY = torusDimY
       )
     )
   }
@@ -326,5 +383,27 @@ class ManticoreFlatArray(
 
   controller.io.core_kill_clock := compute_array.io.dynamic_cycle
   controller.io.cache_done      := io.memory_backend.done
+
+  // X seam boundary: standalone closes the ring inside ComputeArray (extendX=false,
+  // empty ingress). Multi-chip exposes the cut links + control signals to the harness.
+  xb match {
+    case Some(b) =>
+      compute_array.io.extendX := b.extendX
+      b.fwdOut := compute_array.io.xFwdOut
+      b.bwdOut := compute_array.io.xBwdOut
+      compute_array.io.xFwdIn := b.fwdIn
+      compute_array.io.xBwdIn := b.bwdIn
+      b.softResetOut    := controller.io.soft_reset
+      b.configEnableOut := controller.io.config_enable
+    case None =>
+      compute_array.io.extendX := false.B
+      val empty = Wire(new NoCBundle(tX, tY, ManticoreFullISA))
+      empty := DontCare
+      empty.valid := false.B
+      Range(0, dimy).foreach { y =>
+        compute_array.io.xFwdIn(y) := empty
+        compute_array.io.xBwdIn(y) := empty
+      }
+  }
 
 }

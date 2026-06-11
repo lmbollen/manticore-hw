@@ -56,8 +56,15 @@ class TdmLinkMux(nBanks: Int, cyclesPerSlot: Int, DimX: Int, DimY: Int, config: 
   val io = IO(new Bundle {
     val in        = Input(Vec(nBanks, new NoCBundle(DimX, DimY, config)))
     val connected = Input(Bool()) // transceiver attached & link up
-    val tx        = Output(new TdmFrame(DimX, DimY, config, nBanks, cyclesPerSlot))
-    val overflow  = Output(Bool()) // a bank was overwritten before its slot drained it
+    // Boot bypass: drain any valid bank IMMEDIATELY (full rate, no slot rotation).
+    // Used while the bootloader streams programs across the seam — boot traffic is a
+    // single back-to-back stream (at most one bank active per cycle), which would
+    // overflow the slot-rotation banks. The receive side pairs this with an immediate
+    // release, and the harness routes bypass frames through a longer wire pipe so the
+    // total crossing latency stays EXACTLY the configured constant.
+    val bypass   = Input(Bool())
+    val tx       = Output(new TdmFrame(DimX, DimY, config, nBanks, cyclesPerSlot))
+    val overflow = Output(Bool()) // a bank was overwritten before its slot drained it
   })
 
   val banks     = Reg(Vec(nBanks, new NoCBundle(DimX, DimY, config)))
@@ -82,13 +89,18 @@ class TdmLinkMux(nBanks: Int, cyclesPerSlot: Int, DimX: Int, DimY: Int, config: 
     when(bankValid(i)) { bankAge(i) := bankAge(i) + 1.U }
   }
 
-  // transmit at the first cycle of a bank's slot (reads the pre-capture register value)
-  val txValid = io.connected && slotStart && bankValid(slot)
+  // transmit at the first cycle of a bank's slot (reads the pre-capture register value);
+  // in bypass mode transmit ANY valid bank immediately (lowest index first — boot
+  // traffic has at most one active stream, so no contention in practice)
+  val bypassSel   = PriorityEncoder(bankValid)
+  val bypassValid = io.connected && io.bypass && bankValid.asUInt.orR
+  val txSlot      = Mux(io.bypass, bypassSel, slot)
+  val txValid     = Mux(io.bypass, bypassValid, io.connected && slotStart && bankValid(slot))
   io.tx.valid  := txValid
-  io.tx.tag    := slot
-  io.tx.age    := bankAge(slot)
-  io.tx.packet := banks(slot)
-  when(txValid) { bankValid(slot) := false.B }
+  io.tx.tag    := txSlot
+  io.tx.age    := Mux(io.bypass, 0.U, bankAge(slot))
+  io.tx.packet := banks(txSlot)
+  when(txValid) { bankValid(txSlot) := false.B }
 
   // capture (written after drain: a same-cycle capture into the draining bank wins
   // the next-state update, so the new packet is kept and nothing is lost)
@@ -98,7 +110,7 @@ class TdmLinkMux(nBanks: Int, cyclesPerSlot: Int, DimX: Int, DimY: Int, config: 
       banks(i)     := io.in(i)
       bankValid(i) := true.B
       bankAge(i)   := 0.U
-      when(bankValid(i) && !(txValid && slot === i.U)) {
+      when(bankValid(i) && !(txValid && txSlot === i.U)) {
         overflowNow := true.B // previous packet still waiting -> schedule oversubscribed the link
       }
     }
@@ -145,6 +157,7 @@ class TdmLinkDemux(
   val io = IO(new Bundle {
     val rx        = Input(new TdmFrame(DimX, DimY, config, nBanks, cyclesPerSlot))
     val connected = Input(Bool())
+    val bypass    = Input(Bool()) // boot bypass: release immediately (full rate)
     val out       = Output(Vec(nBanks, new NoCBundle(DimX, DimY, config)))
     val overflow  = Output(Bool()) // an output bank was overwritten before its release
   })
@@ -172,7 +185,9 @@ class TdmLinkDemux(
     when(bankValid(io.rx.tag) && !(release(io.rx.tag) === 0.U)) { overflowNow := true.B }
     outBanks(io.rx.tag)  := io.rx.packet
     bankValid(io.rx.tag) := true.B
-    release(io.rx.tag)   := (totalLatency - 3 - wireLatency).U - io.rx.age
+    // bypass: present next cycle (full rate); the harness pads the bypass wire so the
+    // total crossing latency still equals totalLatency exactly
+    release(io.rx.tag)   := Mux(io.bypass, 0.U, (totalLatency - 3 - wireLatency).U - io.rx.age)
   }
   io.overflow := overflowNow
 }
@@ -193,6 +208,16 @@ class TdmTorusBoundaryBridge(
     config: ISA
 ) extends Module {
   val nBanks = 2 * nLinks
+  // The wire must absorb ALL the slack: with wireLatency == totalLatency - period - 2
+  // the demux bank occupancy of an age-a packet is period - a <= period, so a same-link
+  // crossing one TDM period later (the compiler's minimum spacing under --tdm-period)
+  // never overwrites an unreleased bank. A shallower wire moves slack into the demux
+  // hold and period-spaced crossings collide 1 cycle before release.
+  require(
+    totalLatency == 2 * nLinks * cyclesPerSlot + wireLatency + 2,
+    s"totalLatency $totalLatency must equal period ${2 * nLinks * cyclesPerSlot} + wireLatency $wireLatency + 2 " +
+      "(full-rate same-link reuse at one packet per TDM period)"
+  )
   val io = IO(new Bundle {
     // array-facing (connect to BareNoC's xFwdOut/xBwdOut and xFwdIn/xBwdIn)
     val fwdOut = Input(Vec(nLinks, new NoCBundle(DimX, DimY, config)))  // chip egress, fwd channel
@@ -203,7 +228,10 @@ class TdmTorusBoundaryBridge(
     val tx        = Output(new TdmFrame(DimX, DimY, config, 2 * nLinks, cyclesPerSlot))
     val rx        = Input(new TdmFrame(DimX, DimY, config, 2 * nLinks, cyclesPerSlot))
     val connected = Input(Bool())
+    val bypass    = Input(Bool()) // boot bypass (full rate, see TdmLinkMux)
     val overflow  = Output(Bool())
+    val muxOverflow   = Output(Bool()) // source bank churn (oversubscribed egress link)
+    val demuxOverflow = Output(Bool()) // destination bank overwritten before release (REAL data loss)
   })
 
   val mux   = Module(new TdmLinkMux(nBanks, cyclesPerSlot, DimX, DimY, config))
@@ -217,7 +245,11 @@ class TdmTorusBoundaryBridge(
   }
   mux.io.connected   := io.connected
   demux.io.connected := io.connected
+  mux.io.bypass      := io.bypass
+  demux.io.bypass    := io.bypass
   io.tx       := mux.io.tx
   demux.io.rx := io.rx
-  io.overflow := mux.io.overflow || demux.io.overflow
+  io.overflow      := mux.io.overflow || demux.io.overflow
+  io.muxOverflow   := mux.io.overflow
+  io.demuxOverflow := demux.io.overflow
 }

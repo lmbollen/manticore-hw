@@ -47,6 +47,8 @@ class TdmLatencyHarness(val nBanks: Int, val cyclesPerSlot: Int, val D: Int, val
   mux.io.in          := io.in
   mux.io.connected   := true.B
   demux.io.connected := true.B
+  mux.io.bypass      := false.B
+  demux.io.bypass    := false.B
   demux.io.rx := ShiftRegister(mux.io.tx, D) // the fixed-latency "transceiver"
   io.out      := demux.io.out
   io.overflow := mux.io.overflow
@@ -131,6 +133,51 @@ class TdmStaticLatencyTester
             seen should contain only ((b, expected, data))
           }
           dut.clock.step()
+        }
+        dut.io.overflow.peek().litToBoolean shouldBe false
+      }
+    }
+  }
+
+  it should "sustain full rate: same-bank injections exactly one period apart never collide" in {
+    // The compiler (--tdm-period) schedules same-link crossings no closer than one TDM
+    // period. This is only collision-free when the wire absorbs all the slack
+    // (wireLatency == T - period - 2, i.e. slack == 0): the demux bank occupancy is then
+    // period - age <= period and a period-spaced successor lands exactly on the release
+    // boundary. This property would have caught the release==1 overwrites seen in the
+    // two-chip system test, which used a 1-cycle-shallow wire.
+    val fullRateGen = for {
+      cfg   <- cfgGen.map(_.copy(slack = 0))
+      b     <- Gen.choose(0, 9)
+      phase <- Gen.choose(0, 29)
+      n     <- Gen.choose(2, 4) // back-to-back train length
+    } yield (cfg, b % cfg.nBanks, phase % (cfg.nBanks * cfg.n), n)
+
+    forAll(fullRateGen) { case (cfg, b, phase, n) =>
+      test(new TdmLatencyHarness(cfg.nBanks, cfg.n, cfg.d, cfg.T, config)) { dut =>
+        (0 until cfg.nBanks).foreach(i => dut.io.in(i).poke(emptyPkt(dut)))
+        dut.clock.step()
+        val period = cfg.nBanks * cfg.n
+        while ((dut.io.cyc.peek().litValue % period) != phase) dut.clock.step()
+        val t0 = dut.io.cyc.peek().litValue
+        // inject n packets on the SAME bank, exactly one period apart (max legal rate)
+        val expected = (0 until n).map { k =>
+          (b, predictedDelivery(t0 + k * period, b, cfg), (0x4000 + k) & 0xffff)
+        }
+        val seen = scala.collection.mutable.ArrayBuffer.empty[(Int, BigInt, Int)]
+        var k = 0
+        while (dut.io.cyc.peek().litValue <= expected.last._2 + 1) {
+          val cyc = dut.io.cyc.peek().litValue
+          if (k < n && cyc == t0 + BigInt(k) * period) {
+            dut.io.in(b).poke(mkPkt(dut, (0x4000 + k) & 0xffff)); k += 1
+          } else dut.io.in(b).poke(emptyPkt(dut))
+          for (i <- 0 until dut.nBanks)
+            if (dut.io.out(i).valid.peek().litToBoolean)
+              seen += ((i, cyc, dut.io.out(i).data.peek().litValue.toInt))
+          dut.clock.step()
+        }
+        withClue(s"$cfg bank=$b phase=$phase train=$n: ") {
+          seen.toSeq should contain theSameElementsAs expected
         }
         dut.io.overflow.peek().litToBoolean shouldBe false
       }

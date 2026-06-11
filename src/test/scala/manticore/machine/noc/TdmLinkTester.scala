@@ -53,6 +53,7 @@ class TdmTwoChipHarness(val DimX: Int, val DimY: Int, config: ISA, val D: Int, v
     c.io.xFwdIn := b.io.fwdIn
     c.io.xBwdIn := b.io.bwdIn
     b.io.connected := io.connected
+    b.io.bypass    := false.B
   }
 
   // the transceivers: ONE frame wire per direction, fixed latency D
