@@ -17,11 +17,15 @@ remaining observability gap. "Upstream" = `manticore-hw`/`manticore-compiler` @ 
 - ✅ **Root-cause bug found & fixed.** The earlier "halts early at 13 cycles" symptom was a
   **custom-function configuration mismatch**, not a port regression. Fix: compile benchmarks with
   `--no-cf` to match the `enable_custom_alu=false` KCU105 RTL (details below).
-- ⚠️ **One observability gap.** The literal value cannot be read back *through the `$display`
-  trace path* in this harness (the trace store writes zero data — a store/exception drain issue
-  in the RTL, present in **both** URAM and BRAM, i.e. not introduced by the port). Correctness is
-  therefore established **structurally**, which is airtight given the references (see "Why the
-  structural proof is sufficient").
+- ✅ **Observability gap FIXED (2026-06-11).** The `$display` trace now reads back the exact
+  interpreter values (`RF[2] = 0,0,1,3,6,10,15,21,28,36,45` on 2×2 and 4×4). The all-zero
+  readback was NOT the hypothesized store/exception drain race but two RTL bugs (see the
+  updated "remaining gap" section below): the **rs4 register bank was disabled on
+  `enable_custom_alu=false` builds** while `GST`/`GLD` take their address LOW word from rs4
+  (every global access went to address `high##mid##0` = 0), and **MemoryIntercept latched
+  the previous access's data** (`RegEnable` at the start cycle, one compute cycle before the
+  core's gmem addr/wdata settle at the pins). A store-drain guard on Management's exception
+  exit was also added as a safety net.
 
 The self-checking regression test is `src/test/scala/manticore/machine/xrt/Mips32SimTester.scala`
 (passes: `sbt -Dmanticore.no_uram=true -Dmips32.objdir=<dir> "testOnly ...Mips32SimTester"`).
@@ -77,30 +81,38 @@ proving it is a compile-flag/RTL-config alignment issue, not a memory-port or KC
 3. Noticed the RTL was generated `custom_alu=false` but the program (default compile) used CFs →
    recompiled `--no-cf` → RTL now matches. ∎
 
-## The remaining gap: literal value not readable via the `$display` trace
+## The (former) gap: literal value not readable via the `$display` trace — FIXED
 
-Even with correct execution, the `$display` trace records read back as **all-zero**. Instrumented
+Historically the `$display` trace records read back **all-zero** in this harness. Instrumented
 `ManticoreFlatSimKernel` with AXI-write counters (`io.dbg_axi_writes/dbg_last_awaddr/dbg_last_wdata`):
+the cache wrote exactly one line per flush, to address 0, with zero data — identical in URAM and
+BRAM. The original analysis blamed a store-data/exception clock-gate drain race. Cycle-level
+instrumentation of `MemoryIntercept` (2026-06-11) found the actual causes:
 
-- The cache **does** write back exactly **one line per flush, to the correct address 0** (the
-  7-word trace buffer — the only global memory the design uses).
-- But the **data is zero** — even the constant `instr` field (`0x00631826`) is absent.
-- Identical in **URAM and BRAM** → not the port, not the `READ_LATENCY=2` change
-  (`MemoryAccess.scala:132` confirms the design *assumes* read latency 2).
+1. **rs4 register bank disabled on no-CFU builds** (`RegisterFile.scala`): with
+   `enable_custom_alu=false` the rs4 bank was a `DummyDualPortMemory` (reads 0). But `GST`/`GLD`
+   form `address = rs2 ## rs3 ## rs4` with **rs4 = the LOW word** — so every global access on a
+   no-CFU build targeted `high##mid##0`: all 7 trace words landed on address 0 (hence "one line,
+   address 0, wrong data"). Boards built with the custom ALU were unaffected, which is why on-board
+   displays showed values. Fix: enable the bank when
+   `enable_custom_alu || config.WithGlobalMemory` (only the privileged master pays).
 
-**Root cause (analysis):** the 7 trace `GST`s are scheduled immediately before the `FLUSH`
-interrupt with no drain NOPs (by design — the compiler treats stores as latency-0 sinks and
-relies on the RTL's `MemoryIntercept` clock-stall to serialise them). The store *address/start*
-latches into the control-clock cache (dirtying line 0), but the store **data** is still propagating
-through the compute-clock `MemoryAccess`/`MemoryIntercept` path when the `EXPECT(FLUSH)` exception
-gates the compute clock — so zero is committed. This is the host-inspect/trace-readback path
-(paper §A.3.2) and also affects the board. It is an **observability** issue, not a
-simulation-correctness issue.
+2. **`MemoryIntercept` latched the previous access's data**: the core's gmem addr/wdata settle at
+   its pins one compute cycle AFTER `gmem.start` (Execute aligns `start` via `RegNext(opcode)`
+   while addr/wdata come straight from the register-file reads). The access's own `dynamic_cycle`
+   kill plus the clock buffer's CE latency tick the core exactly once more, freezing the pins ON
+   the settled values for the whole drain — but `RegEnable(io.core.wdata, io.core.start)` captured
+   at the start cycle, one cycle early, yielding the previous access's stale values (observed as a
+   one-store-behind shift). Fix: pass addr/wdata/cmd through combinationally; the pins are
+   frozen-stable from `sReq` until the post-`done` revive.
 
-Fixing it properly (so the host can read simulation values) is a follow-up: either drain the
-memory subsystem before the exception halts the clock (RTL), or insert store→interrupt drain in
-the scheduler (compiler). The board's `--no-cf` re-run will show whether the larger,
-single-clock-domain board timing masks the race.
+3. As a safety net, Management's exception exit now waits for any in-flight store:
+   `MemoryIntercept` exports `pending`, and `sVirtualCycle` defers `sDone` (holding the compute
+   clock gated, the cache mux on the core, and `config_enable` low) until the drain completes —
+   otherwise leaving the state force-resets the drain FSM mid-request.
+
+With these fixes `Mips32SimTester` verifies the **literal trace values** on 2×2 and 4×4:
+`RF[2] = 0,0,1,3,6,10,15,21,28,36,45` — exact match to the placed interpreter.
 
 ## Why the structural proof is sufficient
 
@@ -113,8 +125,8 @@ match is not, on its own, a tautology. Combined with:
 
 …the only way the RTL could match all 53 cycles + 31 displays + the precise `$finish` while
 computing a different sum is for the ALU's `ADD` to be wrong in a way that spares the identical
-`ADD` used by the loop counter — which is not plausible. The result `RF[2]=45` is therefore
-established. A direct readback awaits the trace-drain fix (or a scratchpad-exposure debug port).
+`ADD` used by the loop counter — which is not plausible. (Since the trace-readback fixes above,
+this argument is moot for the sim: the literal `RF[2]` values are read back and match exactly.)
 
 ## Changes vs upstream (verification-related)
 

@@ -111,11 +111,15 @@ class RegisterFile(
   }
 
   // Banks 1, 2, and 3 are always enabled (bank 3 is needed for mux instructions' select bit for now).
-  // Bank 4 is disabled if the custom ALU is disabled.
+  // Bank 4 is needed by the custom ALU AND by GLD/GST, whose address LOW word is rs4
+  // (Execute: address := rs2 ## rs3 ## rs4). Disabling it with the custom ALU made every
+  // global memory access on a no-CFU build target address high##mid##0 — all $display
+  // trace stores landed on address 0 and the host read back zeros. Only cores with
+  // global memory (the privileged master) pay for the extra bank when the CFU is off.
   val rs1bank = Module(makeBank(true, config.DataBits))
   val rs2bank = Module(makeBank(true, config.DataBits))
   val rs3bank = Module(makeBank(true, config.DataBits + 1)) // one additional bit for carry
-  val rs4bank = Module(makeBank(enable_custom_alu, config.DataBits))
+  val rs4bank = Module(makeBank(enable_custom_alu || config.WithGlobalMemory, config.DataBits))
 
   io.w <-> rs1bank.io
   io.w <-> rs2bank.io

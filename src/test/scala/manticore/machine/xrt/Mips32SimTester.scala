@@ -189,9 +189,12 @@ class Mips32SimTester extends AnyFlatSpec with ChiselScalatestTester with Matche
         info(s"VERIFIED (structural): RTL ran $vc vcycles, $flushes flushes, ${trace.length} RF-write " +
           s"displays, halted via $$finish (eid 3) — EXACT match to the placed interpreter.")
 
+        // literal value check — readable since the rs4-bank + MemoryIntercept pass-through
+        // fixes (see VERIFICATION.md "The (former) gap")
         val rf2 = trace.filter(_._3 == 2).map(_._4).toList
-        info(s"RF[2] trace values (expect 0,0,1,3,6,10,15,21,28,36,45): $rf2 " +
-          s"${if (rf2.forall(_ == 0)) "(all-zero: trace-store drain limitation, see VERIFICATION.md)" else ""}")
+        val rf2Golden = List[Long](0, 0, 1, 3, 6, 10, 15, 21, 28, 36, 45)
+        info(s"RF[2] trace values (golden $rf2Golden): $rf2")
+        assert(rf2 == rf2Golden, s"RF[2] trace $rf2 != interpreter golden $rf2Golden")
       }
   }
 

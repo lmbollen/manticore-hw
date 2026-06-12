@@ -329,6 +329,7 @@ class ManticoreFlatArray(
   bootloader.io.finish := false.B
 
   controller.io.core_revive_clock := memory_intercept.io.core_revive_clock
+  controller.io.store_pending     := memory_intercept.io.pending
 
   val debug_time = withClockAndReset(
     clock = io.control_clock,

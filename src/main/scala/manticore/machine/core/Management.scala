@@ -47,6 +47,10 @@ class Management(dimX: Int, dimY: Int) extends Module {
     val cache_done        = Input(Bool())
     val execution_active  = Input(Bool())
 
+    // from MemoryIntercept: a core global-memory access is still draining into
+    // the cache. Exceptions must wait for it (see sVirtualCycle).
+    val store_pending = Input(Bool())
+
     val soft_reset = Output(Bool())
   })
 
@@ -57,6 +61,11 @@ class Management(dimX: Int, dimY: Int) extends Module {
   // these two registers help minimize the fan out of clock_active
   val timed_out = Reg(Bool())
   timed_out := false.B
+
+  // an exception fired while a core global-memory store was still draining into the
+  // cache; we stay in sVirtualCycle (clock gated, cache mux on the core) until the
+  // drain completes, then take the exception (see sVirtualCycle)
+  val exception_pending = RegInit(false.B)
 
   val core_exception_id = Reg(io.exception_id.cloneType)
 
@@ -194,16 +203,29 @@ class Management(dimX: Int, dimY: Int) extends Module {
       when(clock_active) {
         clock_active := !(io.core_kill_clock || io.core_exception_occurred)
       } otherwise {
-        clock_active := io.core_revive_clock // revive the clock
+        // do NOT revive into a latched exception: the core must stay frozen at the
+        // precise exception point while the trailing store drains (below)
+        clock_active := io.core_revive_clock && !exception_pending // revive the clock
       }
       core_exception_id := io.exception_id
       when(clock_active) {
         // check exceptions for stopping execution
         when(io.core_exception_occurred) {
-          state := sDone
-          // don't register here, causes large fan out on clock_active!
-          // dev_regs.exception_id := io.exception_id
-          timed_out := false.B
+          // Precise-exception drain guard: a $display/FLUSH is trace GSTs followed by
+          // the interrupt, with no drain NOPs — the last store's data may still be in
+          // MemoryIntercept's control-clock FSM. Leaving sVirtualCycle right away
+          // flips config_enable, which resets that FSM and switches the cache mux to
+          // the boot side MID-REQUEST: the cache commits the line with wdata=0 (the
+          // all-zero $display readback). Hold the state (cache mux stays on the core,
+          // compute clock stays gated) until the store has fully drained.
+          when(io.store_pending) {
+            exception_pending := true.B
+          } otherwise {
+            state := sDone
+            // don't register here, causes large fan out on clock_active!
+            // dev_regs.exception_id := io.exception_id
+            timed_out := false.B
+          }
 
         }.elsewhen(timeout_enabled && vcycleCount.value === timeout) {
           // or when we timeout
@@ -216,6 +238,12 @@ class Management(dimX: Int, dimY: Int) extends Module {
           state := sDone
         }
 
+      }
+      // deferred exception: the in-flight store has drained, now stop for real
+      when(exception_pending && !io.store_pending) {
+        exception_pending := false.B
+        timed_out         := false.B
+        state             := sDone
       }
 
     }
@@ -255,10 +283,16 @@ class MemoryIntercept extends Module {
     val core_kill_clock   = Output(Bool())
     val core_revive_clock = Output(Bool())
     val core_clock        = Input(Clock())
+    // a core-initiated cache access is still in flight (incl. one arriving this
+    // cycle); Management must not leave sVirtualCycle while this is high, or the
+    // config_enable mux below cuts the cache off mid-request
+    val pending = Output(Bool())
 
   })
 
   val state = RegInit(sIdle)
+
+  io.pending := (state =/= sIdle) || (!io.config_enable && io.core.start)
 
   io.boot.done  := false.B
   io.boot.idle  := false.B
@@ -283,9 +317,18 @@ class MemoryIntercept extends Module {
   io.cache.start := false.B
 
   when(!io.config_enable) {
-    io.cache.addr  := RegEnable(io.core.addr, io.core.start)
-    io.cache.wdata := RegEnable(io.core.wdata, io.core.start)
-    io.cache.cmd   := RegEnable(io.core.cmd, io.core.start)
+    // PASS THROUGH, do not latch at io.core.start: the core's gmem address/wdata
+    // settle at its pins one compute cycle AFTER gmem.start (Execute aligns start
+    // via RegNext(opcode) but addr/wdata come straight from the register file
+    // reads). The access's own dynamic_cycle kills the compute clock and — with
+    // the clock buffer's CE latency — the core ticks exactly once more, freezing
+    // the pins ON the settled values for the whole drain (until the post-done
+    // revive). Latching at the start cycle instead captures the PREVIOUS access's
+    // stale addr/wdata — the one-behind trace stores behind the all-zero $display
+    // readback (docs/kcu105/MISSED-DISPLAY-TIMING.md / VERIFICATION.md).
+    io.cache.addr  := io.core.addr
+    io.cache.wdata := io.core.wdata
+    io.cache.cmd   := io.core.cmd
 
     switch(state) {
       is(sIdle) {
