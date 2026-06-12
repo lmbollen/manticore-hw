@@ -57,7 +57,8 @@ class Mips32SimTester extends AnyFlatSpec with ChiselScalatestTester with Matche
     * the placed-interpreter golden.
     */
   def runMips32Test(dimX: Int, dimY: Int, dir: String,
-                    goldenVcycles: Int, goldenFlushes: Int, goldenDisplays: Int): Unit = {
+                    goldenVcycles: Int, goldenFlushes: Int, goldenDisplays: Int,
+                    customAlu: Boolean = false): Unit = {
     // ---- lay out the image like manticore-runtime ----
     val init0 = readWords(s"$dir/init_0/exec.bin")
     val init1 = readWords(s"$dir/init_1/exec.bin")
@@ -71,7 +72,7 @@ class Mips32SimTester extends AnyFlatSpec with ChiselScalatestTester with Matche
     Array.copy(main, 0, image, baseM, main.length)
     info(s"image words=${image.length}  init0@$base0(${init0.length}) init1@$base1(${init1.length}) main@$baseM(${main.length})")
 
-    test(new ManticoreFlatSimKernel(DimX = dimX, DimY = dimY, enable_custom_alu = false))
+    test(new ManticoreFlatSimKernel(DimX = dimX, DimY = dimY, enable_custom_alu = customAlu))
       .withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
         dut.clock.setTimeout(0)
         dut.io.kernel_ctrl.start.poke(false.B)
@@ -210,5 +211,14 @@ class Mips32SimTester extends AnyFlatSpec with ChiselScalatestTester with Matche
   it should "execute the MIPS32 simulation on 4x4 and halt like the golden" taggedAs RequiresVerilator in {
     runMips32Test(dimX = 4, dimY = 4, dir = objdir4,
       goldenVcycles = 53, goldenFlushes = 32, goldenDisplays = 31)
+  }
+
+  // CFU-enabled: the CF-extracted build (6 custom functions, default masm compile) on an
+  // enable_custom_alu=true array. Interpreter golden for this build is identical:
+  // 53 vcycles, 31 RF-write displays, RF[2] -> 45.
+  val objdirCf = sys.props.getOrElse("mips32.objdircf", "/tmp/mips_out_cf")
+  it should "execute the CF-extracted MIPS32 on a custom-ALU 2x2 and halt like the golden" taggedAs RequiresVerilator in {
+    runMips32Test(dimX = 2, dimY = 2, dir = objdirCf,
+      goldenVcycles = 53, goldenFlushes = 32, goldenDisplays = 31, customAlu = true)
   }
 }

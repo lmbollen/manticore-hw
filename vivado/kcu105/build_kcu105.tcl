@@ -55,11 +55,9 @@ create_project -force $proj $build_dir -part $part
 # ---------------------------------------------------------------------------
 # 1. HDL sources (kernel + blackbox bodies + false-path constraint)
 # ---------------------------------------------------------------------------
-add_files -norecurse [list \
-  $hdl_dir/ManticoreFlatKernel.v \
-  $hdl_dir/BRAMLike.v \
-  $hdl_dir/AluDsp48.v \
-  $hdl_dir/ClockDistribution.v ]
+# take every emitted Verilog file: the kernel + ALL blackbox bodies (BRAMLike,
+# AluDsp48, ClockDistribution, and — on enable_custom_alu builds — Wrapped32x16RAM)
+add_files -norecurse [glob $hdl_dir/*.v]
 add_files -fileset constrs_1 -norecurse $hdl_dir/false_path.xdc
 set_property xpm_libraries {XPM_CDC XPM_MEMORY XPM_FIFO} [current_project]
 
