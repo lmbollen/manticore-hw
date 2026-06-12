@@ -15,6 +15,9 @@ import manticore.machine.core.HostRegisters
 import manticore.machine.core.ManticoreFlatArray
 import manticore.machine.core.MemoryReadWriteInterface
 import manticore.machine.memory.CacheConfig
+import manticore.machine.memory.GmemBramBackend
+import manticore.machine.memory.GmemBramPort
+import manticore.machine.memory.SimGmem
 
 import java.io.File
 import java.io.PrintWriter
@@ -183,47 +186,35 @@ class ManticoreFlatSimKernel(
 
   clock_distribution.io.compute_clock_en := manticore.io.clock_active
 
-  val axi_cache = withClockAndReset(
+  // fixed-latency BRAM gmem (replaces CacheSubsystem + AxiMemoryModel; the gmem
+  // clock-kill is gone — see GmemBramBackend)
+  val gmem_backend = withClockAndReset(
     clock = clock_distribution.io.control_clock,
     reset = reset
   ) {
-    Module(new CacheSubsystem)
+    Module(new GmemBramBackend(GmemBramBackend.addrBitsFor(1 << 20)))
   }
-
-  val axi_mem = withClockAndReset(
+  val gmem = withClockAndReset(
     clock = clock_distribution.io.control_clock,
     reset = reset
   ) {
-    Module(new AxiMemoryModel(AxiCacheAdapter.CacheAxiParameters, 1 << 20, ManticoreFullISA.DataBits))
+    Module(new SimGmem(1 << 20))
   }
 
-  axi_cache.io.base := 0.U
-  axi_cache.io.core <> manticore.io.memory_backend
-  axi_cache.io.bus <> axi_mem.io.axi
-  axi_cache.io.core <> manticore.io.memory_backend
-  axi_mem.io.sim.waddr := io.dmi.addr
-  axi_mem.io.sim.raddr := io.dmi.addr
-  axi_mem.io.sim.lock  := io.dmi.locked
-  axi_mem.io.sim.wdata := io.dmi.wdata
-  axi_mem.io.sim.wen   := io.dmi.wen
-  io.dmi.rdata         := axi_mem.io.sim.rdata
+  gmem_backend.io.front <> manticore.io.memory_backend
+  gmem.io.bram <> gmem_backend.io.bram
 
-  // diagnostics: count AXI write-address handshakes (cache writebacks) into axi_mem
-  withClockAndReset(clock_distribution.io.control_clock, reset) {
-    val dbgWrites    = RegInit(0.U(32.W))
-    val dbgLastAwadr = RegInit(0.U(64.W))
-    val dbgLastWdata = RegInit(0.U(64.W))
-    when(axi_mem.io.axi.AWVALID && axi_mem.io.axi.AWREADY) {
-      dbgWrites    := dbgWrites + 1.U
-      dbgLastAwadr := axi_mem.io.axi.AWADDR
-    }
-    when(axi_mem.io.axi.WVALID && axi_mem.io.axi.WREADY) {
-      dbgLastWdata := axi_mem.io.axi.WDATA(63, 0)
-    }
-    io.dbg_axi_writes  := dbgWrites
-    io.dbg_last_awaddr := dbgLastAwadr
-    io.dbg_last_wdata  := dbgLastWdata
-  }
+  gmem.io.dmi.addr  := io.dmi.addr
+  gmem.io.dmi.wdata := io.dmi.wdata
+  gmem.io.dmi.wen   := io.dmi.wen
+  io.dmi.rdata      := gmem.io.dmi.rdata
+  // io.dmi.locked is unused: gmem is dual-ported, the host port never contends
+
+  // the cache + AXI memory model are gone; the AXI write-observation debug
+  // ports are kept for tester compatibility, tied off
+  io.dbg_axi_writes  := 0.U
+  io.dbg_last_awaddr := 0.U
+  io.dbg_last_wdata  := 0.U
 
 }
 
@@ -673,6 +664,10 @@ object ManticoreKernelGenerator {
   */
 object KCU105Generator {
 
+  // gmem size in 16-bit words (log2); must match ManticoreFlatBramKernel's
+  // default and build_kcu105.tcl's mem_kib (17 -> 256 KiB)
+  val kcu105GmemAddrBits = 17
+
   def apply(
       target_dir: String,
       dimx: Int = 2,
@@ -695,9 +690,9 @@ object KCU105Generator {
       )
     }
 
-    println(s"[kcu105] emitting ManticoreFlatKernel (${dimx}x${dimy}, ${freqMhz} MHz, part ${part})")
+    println(s"[kcu105] emitting ManticoreFlatBramKernel (${dimx}x${dimy}, ${freqMhz} MHz, part ${part})")
     val vlog = new ChiselStage().emitVerilog(
-      new ManticoreFlatKernel(
+      new ManticoreFlatBramKernel(
         DimX = dimx,
         DimY = dimy,
         enable_custom_alu = enable_custom_alu,
@@ -713,6 +708,36 @@ object KCU105Generator {
       )
     )
 
+    // X_INTERFACE_INFO so the block design sees the kernel's gmem pin group as
+    // a BRAM-controller-compatible slave (axi_bram_ctrl/BRAM_PORTA connects to
+    // it directly, keeping the JTAG image-load flow at AXI offset 0x0).
+    val gmemIfaceRoles = Map(
+      "gmem_clk"  -> "CLK",
+      "gmem_rst"  -> "RST",
+      "gmem_en"   -> "EN",
+      "gmem_we"   -> "WE",
+      "gmem_addr" -> "ADDR",
+      "gmem_din"  -> "DIN",
+      "gmem_dout" -> "DOUT"
+    )
+    def annotatePort(line: String): String = {
+      val portDecl = new Regex("""^(\s*)(input|output)(\s+(?:\[[^\]]+\]\s*)?)(gmem_\w+)([,)]?\s*)$""")
+      portDecl.findFirstMatchIn(line) match {
+        case Some(m) if gmemIfaceRoles.contains(m.group(4)) =>
+          val role = gmemIfaceRoles(m.group(4))
+          // Full BRAM-slave property set: axi_bram_ctrl's post_propagate script
+          // requires these from a connected custom RTL slave (MASTER_TYPE alone
+          // makes it demand the rest, e.g. READ_WRITE_MODE).
+          val gmemBytes = 1 << (kcu105GmemAddrBits + 1)
+          val param =
+            if (m.group(4) == "gmem_clk")
+              s"""(* X_INTERFACE_PARAMETER = "MASTER_TYPE BRAM_CTRL, MEM_SIZE ${gmemBytes}, MEM_WIDTH 32, MEM_ECC NONE, READ_WRITE_MODE READ_WRITE, READ_LATENCY 2" *) """
+            else ""
+          s"""${m.group(1)}${param}(* X_INTERFACE_INFO = "xilinx.com:interface:bram:1.0 GMEM ${role}" *) ${line.trim}"""
+        case _ => line
+      }
+    }
+
     // Same keep_hierarchy annotation as the Alveo flow, so hierarchical constraints work.
     val vlogWithKeep = vlog
       .split("\n")
@@ -722,7 +747,7 @@ object KCU105Generator {
           "indent"
         )
         pattern.findFirstMatchIn(line) match {
-          case None => line
+          case None => annotatePort(line)
           case Some(value) =>
             val indent = value.group("indent")
             s"""${indent}(* keep_hierarchy = "yes" *)${line}"""
@@ -730,7 +755,7 @@ object KCU105Generator {
       }
       .mkString("\n")
 
-    val kernelV = hdl_dir.resolve("ManticoreFlatKernel.v")
+    val kernelV = hdl_dir.resolve("ManticoreFlatBramKernel.v")
     val w       = Files.newBufferedWriter(kernelV)
     w.write(vlogWithKeep)
     w.close()

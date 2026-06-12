@@ -12,6 +12,8 @@ import manticore.machine.core.NoCBundle
 import manticore.machine.core.TdmFrame
 import manticore.machine.core.TdmTorusBoundaryBridge
 import manticore.machine.memory.CacheConfig
+import manticore.machine.memory.GmemBramBackend
+import manticore.machine.memory.SimGmem
 
 /** A two-IC simulation model of a single global torus split across two chips.
   *
@@ -263,36 +265,22 @@ class TwoChipTdmSimKernel(
     io.dbg_seam_dataloss := loss
   }
 
-  // ---------------- Chip A cache subsystem (unchanged from the single-chip kernel) -----
-  val axi_cache = withClockAndReset(clock_distribution.io.control_clock, reset) {
-    Module(new CacheSubsystem)
+  // ---------------- Chip A gmem (fixed-latency BRAM, as in the single-chip kernel) -----
+  val gmem_backend = withClockAndReset(clock_distribution.io.control_clock, reset) {
+    Module(new GmemBramBackend(GmemBramBackend.addrBitsFor(1 << 20)))
   }
-  val axi_mem = withClockAndReset(clock_distribution.io.control_clock, reset) {
-    Module(new AxiMemoryModel(AxiCacheAdapter.CacheAxiParameters, 1 << 20, ManticoreFullISA.DataBits))
+  val gmem = withClockAndReset(clock_distribution.io.control_clock, reset) {
+    Module(new SimGmem(1 << 20))
   }
-  axi_cache.io.base := 0.U
-  axi_cache.io.core <> chipA.io.memory_backend
-  axi_cache.io.bus  <> axi_mem.io.axi
-  axi_mem.io.sim.waddr := io.dmi.addr
-  axi_mem.io.sim.raddr := io.dmi.addr
-  axi_mem.io.sim.lock  := io.dmi.locked
-  axi_mem.io.sim.wdata := io.dmi.wdata
-  axi_mem.io.sim.wen   := io.dmi.wen
-  io.dmi.rdata         := axi_mem.io.sim.rdata
+  gmem_backend.io.front <> chipA.io.memory_backend
+  gmem.io.bram <> gmem_backend.io.bram
+  gmem.io.dmi.addr  := io.dmi.addr
+  gmem.io.dmi.wdata := io.dmi.wdata
+  gmem.io.dmi.wen   := io.dmi.wen
+  io.dmi.rdata      := gmem.io.dmi.rdata
 
-  withClockAndReset(clock_distribution.io.control_clock, reset) {
-    val dbgWrites    = RegInit(0.U(32.W))
-    val dbgLastAwadr = RegInit(0.U(64.W))
-    val dbgLastWdata = RegInit(0.U(64.W))
-    when(axi_mem.io.axi.AWVALID && axi_mem.io.axi.AWREADY) {
-      dbgWrites    := dbgWrites + 1.U
-      dbgLastAwadr := axi_mem.io.axi.AWADDR
-    }
-    when(axi_mem.io.axi.WVALID && axi_mem.io.axi.WREADY) {
-      dbgLastWdata := axi_mem.io.axi.WDATA(63, 0)
-    }
-    io.dbg_axi_writes  := dbgWrites
-    io.dbg_last_awaddr := dbgLastAwadr
-    io.dbg_last_wdata  := dbgLastWdata
-  }
+  // cache + AXI model are gone; debug ports kept for tester compatibility
+  io.dbg_axi_writes  := 0.U
+  io.dbg_last_awaddr := 0.U
+  io.dbg_last_wdata  := 0.U
 }

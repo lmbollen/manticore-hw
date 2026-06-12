@@ -390,8 +390,7 @@ class ManticoreFlatArray(
     .pad(bootloader.io.instruction_stream_base.getWidth)
   bootloader.io.finish := false.B
 
-  controller.io.core_revive_clock := memory_intercept.io.core_revive_clock
-  controller.io.store_pending     := memory_intercept.io.pending
+  controller.io.store_pending := memory_intercept.io.pending
 
   val debug_time = withClockAndReset(
     clock = io.control_clock,
@@ -444,8 +443,9 @@ class ManticoreFlatArray(
   controller.io.schedule_config         := io.host_registers.schedule_config
   controller.io.clock_locked            := io.clock_stabled
 
-  controller.io.core_kill_clock := compute_array.io.dynamic_cycle
-  controller.io.cache_done      := io.memory_backend.done
+  // dynamic_cycle (gmem clock-kill) is gone: global memory is a fixed-latency
+  // on-chip BRAM (GmemBramBackend), so gmem accesses never gate the clock.
+  controller.io.cache_done := io.memory_backend.done
 
   // Seam boundaries: standalone closes all four cuts inside ComputeArray
   // (extend=false, empty ingress). Multi-chip exposes the sides to the harness.

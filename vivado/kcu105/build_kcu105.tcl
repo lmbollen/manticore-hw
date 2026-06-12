@@ -6,8 +6,14 @@
 #   vivado -mode batch -source build_kcu105.tcl -tclargs <hdl_dir> <build_dir> \
 #          [part] [freq_mhz] [stop_after] [mem_kib]
 #
-#   hdl_dir    : dir containing ManticoreFlatKernel.v + BRAMLike.v + AluDsp48.v +
-#                ClockDistribution.v + false_path.xdc (output of `-t kcu105` gen)
+#   hdl_dir    : dir containing ManticoreFlatBramKernel.v + BRAMLike.v + AluDsp48.v +
+#                ClockDistribution.v + TrueDualPortBram.v + false_path.xdc
+#                (output of `-t kcu105` gen). The gmem BRAM lives INSIDE the
+#                kernel (fixed-latency gmem, no cache/m_axi); the AXI BRAM
+#                controller connects to the kernel's exported GMEM port, so the
+#                JTAG image-load flow (run.tcl) is unchanged.
+#                NOTE: mem_kib must match the kernel's gmemAddrBits (256 KiB
+#                default <-> gmemAddrBits=17); regenerate HDL if it changes.
 #   build_dir  : output/project dir
 #   part        : FPGA part (default xcku040-ffva1156-2-e; falls back to the
 #                 installed xcku035-ffva1156-2-e stand-in if xcku040 is absent)
@@ -28,7 +34,11 @@ if {$argc < 2} {
 set hdl_dir     [file normalize [lindex $argv 0]]
 set build_dir   [file normalize [lindex $argv 1]]
 set part        [expr {$argc > 2 ? [lindex $argv 2] : "xcku040-ffva1156-2-e"}]
-set ap_clk_mhz  [expr {$argc > 3 ? [lindex $argv 3] : 200.0}]
+# ap_clk default dropped 200 -> 100 MHz with the in-kernel gmem BRAM: the
+# host side only serves JTAG + sparse control writes, and the 64-BRAM36 gmem
+# array's port-A output path (inter-BRAM cascade mux -> output reg) is
+# structurally marginal at 200 MHz (missed by ~15 ps incl. with OUT_REG_A).
+set ap_clk_mhz  [expr {$argc > 3 ? [lindex $argv 3] : 100.0}]
 set compute_mhz [expr {$argc > 4 ? [lindex $argv 4] : 100.0}]
 set stop_after  [expr {$argc > 5 ? [lindex $argv 5] : "bits"}]
 set mem_kib     [expr {$argc > 6 ? [lindex $argv 6] : 256}]
@@ -81,7 +91,9 @@ set_property -dict [list \
   CONFIG.CLKOUT1_DRIVES {No_buffer} \
 ] [get_ips clk_dist]
 
-# AXI clock crossers between the compute domain (s_axi side) and ap_clk (m_axi side).
+# AXI-Lite clock crosser between ap_clk (s_axi_control side) and the compute domain.
+# (The 256-bit AXI4 crosser is gone: the kernel has no AXI master anymore — gmem
+# is an internal fixed-latency BRAM.)
 create_ip -name axi_clock_converter -vendor xilinx.com -library ip -version 2.1 -module_name axi4lite_clock_converter
 set_property -dict [list \
   CONFIG.PROTOCOL {AXI4LITE} CONFIG.ADDR_WIDTH {12} CONFIG.SYNCHRONIZATION_STAGES {3} \
@@ -89,15 +101,6 @@ set_property -dict [list \
   CONFIG.RUSER_WIDTH {0} CONFIG.WUSER_WIDTH {0} CONFIG.BUSER_WIDTH {0} CONFIG.ACLK_ASYNC {1} \
   CONFIG.SI_CLK.FREQ_HZ $compute_hz CONFIG.MI_CLK.FREQ_HZ $ap_clk_hz \
 ] [get_ips axi4lite_clock_converter]
-
-create_ip -name axi_clock_converter -vendor xilinx.com -library ip -version 2.1 -module_name axi4_clock_converter
-set_property -dict [list \
-  CONFIG.PROTOCOL {AXI4} CONFIG.ADDR_WIDTH {64} CONFIG.SYNCHRONIZATION_STAGES {3} \
-  CONFIG.DATA_WIDTH $cacheline_width CONFIG.ID_WIDTH {0} CONFIG.AWUSER_WIDTH {0} \
-  CONFIG.ARUSER_WIDTH {0} CONFIG.RUSER_WIDTH {0} CONFIG.WUSER_WIDTH {0} CONFIG.BUSER_WIDTH {0} \
-  CONFIG.ACLK_ASYNC {1} \
-  CONFIG.SI_CLK.FREQ_HZ $compute_hz CONFIG.MI_CLK.FREQ_HZ $ap_clk_hz \
-] [get_ips axi4_clock_converter]
 
 generate_target all [get_ips]
 
@@ -127,21 +130,24 @@ set_property -dict [list CONFIG.C_SIZE {1} CONFIG.C_OPERATION {not}] $rstinv
 set jtag [create_bd_cell -type ip -vlnv xilinx.com:ip:jtag_axi:1.2 jtag_axi_0]
 set_property -dict [list CONFIG.PROTOCOL {2} CONFIG.M_AXI_DATA_WIDTH {32} CONFIG.M_AXI_ADDR_WIDTH {32}] $jtag
 
-# --- SmartConnect: 2 masters (kernel m_axi, jtag) x 2 slaves (BRAM, s_axi_control) ---
+# --- SmartConnect: 1 master (jtag) x 2 slaves (gmem BRAM ctrl, s_axi_control) ---
 set sc [create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:1.0 smartconnect_0]
-set_property -dict [list CONFIG.NUM_SI {2} CONFIG.NUM_MI {2} CONFIG.NUM_CLKS {1}] $sc
+set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {2} CONFIG.NUM_CLKS {1}] $sc
 
-# --- AXI BRAM controller (the device "DRAM"); block automation creates + sizes the
-#     block memory so its widths/depth match the controller correctly. ---
+# --- AXI BRAM controller fronting the kernel's INTERNAL gmem BRAM (port A of
+#     the kernel's TDP BRAM, exported as the GMEM pin group). 32-bit data: the
+#     only AXI master is the 32-bit JTAG bridge. ---
 set bramc [create_bd_cell -type ip -vlnv xilinx.com:ip:axi_bram_ctrl:4.1 axi_bram_ctrl_0]
-set_property -dict [list CONFIG.DATA_WIDTH {256} CONFIG.SINGLE_PORT_BRAM {1} CONFIG.ECC_TYPE {0}] $bramc
-apply_bd_automation -rule xilinx.com:bd_rule:bram_cntlr -config {BRAM "Auto"} \
-  [get_bd_intf_pins axi_bram_ctrl_0/BRAM_PORTA]
+set_property -dict [list CONFIG.DATA_WIDTH {32} CONFIG.SINGLE_PORT_BRAM {1} CONFIG.ECC_TYPE {0} \
+  CONFIG.READ_LATENCY {2}] $bramc
 
 # --- the Manticore kernel (RTL module reference) ---
-set krnl [create_bd_cell -type module -reference ManticoreFlatKernel kernel_0]
-# Associate ap_clk with the kernel's AXI interfaces (single clock domain in this BD).
-catch { set_property CONFIG.ASSOCIATED_BUSIF {m_axi_bank_0:s_axi_control} [get_bd_pins kernel_0/ap_clk] }
+set krnl [create_bd_cell -type module -reference ManticoreFlatBramKernel kernel_0]
+# Associate ap_clk with the kernel's AXI interface (single clock domain in this BD).
+catch { set_property CONFIG.ASSOCIATED_BUSIF {s_axi_control} [get_bd_pins kernel_0/ap_clk] }
+
+# gmem: BRAM controller port A straight into the kernel's exported BRAM port
+connect_bd_intf_net [get_bd_intf_pins axi_bram_ctrl_0/BRAM_PORTA] [get_bd_intf_pins kernel_0/GMEM]
 
 # --- connections: clocks & resets ---
 connect_bd_net [get_bd_pins clk_wiz_0/clk_out1] \
@@ -159,8 +165,7 @@ connect_bd_net [get_bd_pins proc_sys_reset_0/peripheral_aresetn] \
   [get_bd_pins axi_bram_ctrl_0/s_axi_aresetn]
 
 # --- connections: AXI interfaces ---
-connect_bd_intf_net [get_bd_intf_pins kernel_0/m_axi_bank_0] [get_bd_intf_pins smartconnect_0/S00_AXI]
-connect_bd_intf_net [get_bd_intf_pins jtag_axi_0/M_AXI]      [get_bd_intf_pins smartconnect_0/S01_AXI]
+connect_bd_intf_net [get_bd_intf_pins jtag_axi_0/M_AXI]       [get_bd_intf_pins smartconnect_0/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins smartconnect_0/M00_AXI] [get_bd_intf_pins axi_bram_ctrl_0/S_AXI]
 connect_bd_intf_net [get_bd_intf_pins smartconnect_0/M01_AXI] [get_bd_intf_pins kernel_0/s_axi_control]
 
@@ -178,9 +183,6 @@ assign_bd_address -offset 0x00000000 -range $mem_bytes \
   [get_bd_addr_segs {axi_bram_ctrl_0/S_AXI/Mem0}]
 assign_bd_address -offset 0x00100000 -range 0x00001000 \
   [get_bd_addr_segs {kernel_0/s_axi_control/reg0}]
-# kernel master must not reach s_axi_control; jtag must not be required to. Prune the
-# stray kernel->s_axi_control segment if it was auto-created.
-catch { exclude_bd_addr_seg -target_address_space [get_bd_addr_spaces kernel_0/m_axi_bank_0] [get_bd_addr_segs kernel_0/s_axi_control/reg0] }
 
 regenerate_bd_layout
 validate_bd_design

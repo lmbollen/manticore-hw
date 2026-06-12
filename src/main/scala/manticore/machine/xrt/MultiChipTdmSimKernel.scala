@@ -12,6 +12,8 @@ import manticore.machine.core.NoCBundle
 import manticore.machine.core.TdmFrame
 import manticore.machine.core.TdmTorusBoundaryBridge
 import manticore.machine.memory.CacheConfig
+import manticore.machine.memory.GmemBramBackend
+import manticore.machine.memory.SimGmem
 
 /** A `chipCols x chipRows` grid of `chipDimX x chipDimY` chips forming ONE global
   * 2D torus of `gDimX x gDimY` cores (e.g. 8 chips of 4x4 as a 2x4 grid -> 8x16),
@@ -224,20 +226,17 @@ class MultiChipTdmSimKernel(
     io.dbg_seam_dataloss := loss
   }
 
-  // ---------------- master cache subsystem + sim memory (as in the single-chip kernel) ---
-  val axi_cache = withClockAndReset(clock_distribution.io.control_clock, reset) {
-    Module(new CacheSubsystem)
+  // ---------------- master gmem (fixed-latency BRAM, as in the single-chip kernel) ---
+  val gmem_backend = withClockAndReset(clock_distribution.io.control_clock, reset) {
+    Module(new GmemBramBackend(GmemBramBackend.addrBitsFor(1 << 20)))
   }
-  val axi_mem = withClockAndReset(clock_distribution.io.control_clock, reset) {
-    Module(new AxiMemoryModel(AxiCacheAdapter.CacheAxiParameters, 1 << 20, ManticoreFullISA.DataBits))
+  val gmem = withClockAndReset(clock_distribution.io.control_clock, reset) {
+    Module(new SimGmem(1 << 20))
   }
-  axi_cache.io.base := 0.U
-  axi_cache.io.core <> master.io.memory_backend
-  axi_cache.io.bus  <> axi_mem.io.axi
-  axi_mem.io.sim.waddr := io.dmi.addr
-  axi_mem.io.sim.raddr := io.dmi.addr
-  axi_mem.io.sim.lock  := io.dmi.locked
-  axi_mem.io.sim.wdata := io.dmi.wdata
-  axi_mem.io.sim.wen   := io.dmi.wen
-  io.dmi.rdata         := axi_mem.io.sim.rdata
+  gmem_backend.io.front <> master.io.memory_backend
+  gmem.io.bram <> gmem_backend.io.bram
+  gmem.io.dmi.addr  := io.dmi.addr
+  gmem.io.dmi.wdata := io.dmi.wdata
+  gmem.io.dmi.wen   := io.dmi.wen
+  io.dmi.rdata      := gmem.io.dmi.rdata
 }

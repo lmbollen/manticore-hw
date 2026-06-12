@@ -31,8 +31,6 @@ class Management(dimX: Int, dimY: Int) extends Module {
     val boot_start    = Output(Bool())
     val boot_finished = Input(Bool())
 
-    val core_kill_clock         = Input(Bool())
-    val core_revive_clock       = Input(Bool())
     val core_exception_occurred = Input(Bool())
     val clock_active            = Output(Bool())
     val clock_locked            = Input(Bool())
@@ -200,12 +198,12 @@ class Management(dimX: Int, dimY: Int) extends Module {
 
     is(sVirtualCycle) {
 
+      // The gmem clock-kill is gone (global memory is a fixed-latency on-chip
+      // BRAM, see GmemBramBackend): during execution the clock only ever gates
+      // on an exception, and stays gated until the host resumes via
+      // CMD_RESUME in sIdle.
       when(clock_active) {
-        clock_active := !(io.core_kill_clock || io.core_exception_occurred)
-      } otherwise {
-        // do NOT revive into a latched exception: the core must stay frozen at the
-        // precise exception point while the trailing store drains (below)
-        clock_active := io.core_revive_clock && !exception_pending // revive the clock
+        clock_active := !io.core_exception_occurred
       }
       core_exception_id := io.exception_id
       when(clock_active) {
@@ -266,10 +264,6 @@ class Management(dimX: Int, dimY: Int) extends Module {
 
 class MemoryIntercept extends Module {
 
-  object State extends ChiselEnum {
-    val sIdle, sReq, sWait, sRevive, sKill = Value
-  }
-  import State._
   val io = IO(new Bundle {
 
     val core          = CacheConfig.frontInterface()
@@ -279,38 +273,36 @@ class MemoryIntercept extends Module {
     val cache_flush = Input(Bool())
     val cache_reset = Input(Bool())
 
-    val cache             = Flipped(CacheConfig.frontInterface())
-    val core_kill_clock   = Output(Bool())
-    val core_revive_clock = Output(Bool())
-    val core_clock        = Input(Clock())
-    // a core-initiated cache access is still in flight (incl. one arriving this
+    val cache      = Flipped(CacheConfig.frontInterface())
+    val core_clock = Input(Clock())
+    // a core-initiated gmem access is still in flight (incl. one arriving this
     // cycle); Management must not leave sVirtualCycle while this is high, or the
-    // config_enable mux below cuts the cache off mid-request
+    // config_enable mux below cuts the backend off mid-request
     val pending = Output(Bool())
 
   })
 
-  val state = RegInit(sIdle)
-
-  io.pending := (state =/= sIdle) || (!io.config_enable && io.core.start)
+  // request lifetime with the fixed-latency BRAM backend: start (core) ->
+  // start+1 (backend capture, done) -> start+2 (rdata registered into the core
+  // clock domain)
+  private val inflight1 = RegNext(!io.config_enable && io.core.start, false.B)
+  private val inflight2 = RegNext(inflight1, false.B)
+  io.pending := (!io.config_enable && io.core.start) || inflight1 || inflight2
 
   io.boot.done  := false.B
   io.boot.idle  := false.B
   io.boot.rdata := DontCare
 
-  io.core.done         := false.B
-  io.core_kill_clock   := false.B
-  io.core_revive_clock := false.B
+  io.core.done := false.B
 
   io.core.idle := false.B
 
-  // Necessary evil: we need to register the result of the cache read in the
-  // core (compute) clock domain, otherwise back to back reads will discard the
-  // first read and double-counts the last read. This is done to fake the
-  // behavior of a 2-cycle read latency on the core side, so the core can be
-  // designed completely oblivious to the fact that DRAM access can take
-  // arbitrary many cycles, instead it sees it as a SRAM memory with 2-cycle
-  // read latency!
+  // Register the read result in the core (compute) clock domain: the core was
+  // always designed against a "2-cycle SRAM" gmem contract (address at the pins
+  // one cycle after start, data two cycles after that). With the fixed-latency
+  // BRAM backend that contract is now physically true — no clock-kill needed —
+  // but the core-domain register stays: if an exception freezes the core while
+  // a read is in flight, it holds the result until the core resumes.
   io.core.rdata := withClock(clock = io.core_clock) {
     RegNext(io.cache.rdata)
   }
@@ -320,47 +312,18 @@ class MemoryIntercept extends Module {
     // PASS THROUGH, do not latch at io.core.start: the core's gmem address/wdata
     // settle at its pins one compute cycle AFTER gmem.start (Execute aligns start
     // via RegNext(opcode) but addr/wdata come straight from the register file
-    // reads). The access's own dynamic_cycle kills the compute clock and — with
-    // the clock buffer's CE latency — the core ticks exactly once more, freezing
-    // the pins ON the settled values for the whole drain (until the post-done
-    // revive). Latching at the start cycle instead captures the PREVIOUS access's
-    // stale addr/wdata — the one-behind trace stores behind the all-zero $display
-    // readback (docs/kcu105/MISSED-DISPLAY-TIMING.md / VERIFICATION.md).
+    // reads). So the backend request fires one cycle after io.core.start, with
+    // the address/wdata combinationally passed from the (settled) pins. If an
+    // exception gates the compute clock meanwhile, the BUFGCE freeze holds the
+    // pins ON the settled values, so this control-clock capture still reads the
+    // correct request (see docs/kcu105/MISSED-DISPLAY-TIMING.md /
+    // VERIFICATION.md for the one-behind failure mode that latching at the
+    // start cycle causes).
     io.cache.addr  := io.core.addr
     io.cache.wdata := io.core.wdata
     io.cache.cmd   := io.core.cmd
-
-    switch(state) {
-      is(sIdle) {
-        when(io.core.start) {
-          state              := sReq
-          io.core_kill_clock := true.B
-        }
-      }
-      is(sReq) {
-        io.cache.start := true.B
-        state          := sWait
-      }
-      is(sWait) {
-        when(io.cache.done) {
-          state := sRevive
-        }
-      }
-      is(sRevive) {
-        io.core_revive_clock := true.B
-        when(io.core.start) {
-          state := sKill // there is another request
-        } otherwise {
-          state := sIdle
-        }
-      }
-      is(sKill) {
-        io.core_kill_clock := true.B
-        state              := sReq
-      }
-    }
+    io.cache.start := RegNext(io.core.start, false.B)
   } otherwise {
-    state := sIdle
     io.cache <> io.boot
 
     when(io.cache_flush) {
@@ -370,9 +333,6 @@ class MemoryIntercept extends Module {
       io.cache.cmd   := CacheCommand.Reset
       io.cache.start := true.B
     }
-
-    io.core_kill_clock   := false.B
-    io.core_revive_clock := false.B
 
   }
 
