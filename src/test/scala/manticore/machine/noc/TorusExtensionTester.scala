@@ -7,6 +7,7 @@ import manticore.machine.ISA
 import manticore.machine.ManticoreBaseISA
 import manticore.machine.TestsCommon.RequiresVerilator
 import manticore.machine.core.BareNoC
+import manticore.machine.core.BareNoCInterface
 import manticore.machine.core.NoCBundle
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
@@ -36,25 +37,43 @@ class TwoChipHarness(val DimX: Int, val DimY: Int, config: ISA) extends Module {
 
   val chips = Seq.fill(2)(Module(new BareNoC(DimX, DimY, config, n_hop = 1, torusDimX = TX, torusDimY = TY)))
   chips.zipWithIndex.foreach { case (c, i) =>
-    c.io.extendX      := io.extendX
-    c.io.extendY      := io.extendY
     c.io.configEnable := false.B
     c.io.configPacket := NoCBundle.empty(TX, TY, config)
     c.io.corePacketInput := io.in(i)
     io.out(i) := c.io.corePacketOutput
   }
 
-  // X-dimension cross links (used when extendX): each chip's egress -> the other's ingress
-  chips(0).io.xFwdIn := chips(1).io.xFwdOut
-  chips(1).io.xFwdIn := chips(0).io.xFwdOut
-  chips(0).io.xBwdIn := chips(1).io.xBwdOut
-  chips(1).io.xBwdIn := chips(0).io.xBwdOut
+  // Per-side model: chip0 is WEST/SOUTH of chip1. One cable per dimension:
+  // chip0.east <-> chip1.west (X) and chip0.north <-> chip1.south (Y); the chain's
+  // outer sides (chip0.west, chip1.east, chip0.south, chip1.north) stay U-turned.
+  chips(0).io.extendEast  := io.extendX
+  chips(1).io.extendWest  := io.extendX
+  chips(0).io.extendWest  := false.B
+  chips(1).io.extendEast  := false.B
+  chips(0).io.extendNorth := io.extendY
+  chips(1).io.extendSouth := io.extendY
+  chips(0).io.extendSouth := false.B
+  chips(1).io.extendNorth := false.B
 
-  // Y-dimension cross links (used when extendY)
-  chips(0).io.yFwdIn := chips(1).io.yFwdOut
-  chips(1).io.yFwdIn := chips(0).io.yFwdOut
-  chips(0).io.yBwdIn := chips(1).io.yBwdOut
-  chips(1).io.yBwdIn := chips(0).io.yBwdOut
+  chips(1).io.west.fwdIn := chips(0).io.east.fwdOut
+  chips(0).io.east.fwdIn := chips(1).io.west.fwdOut
+  chips(1).io.west.bwdIn := chips(0).io.east.bwdOut
+  chips(0).io.east.bwdIn := chips(1).io.west.bwdOut
+
+  chips(1).io.south.fwdIn := chips(0).io.north.fwdOut
+  chips(0).io.north.fwdIn := chips(1).io.south.fwdOut
+  chips(1).io.south.bwdIn := chips(0).io.north.bwdOut
+  chips(0).io.north.bwdIn := chips(1).io.south.bwdOut
+
+  // unused (U-turned) outer sides: empty ingress
+  private def tieIn(side: BareNoCInterface#Side): Unit = {
+    side.fwdIn.foreach(_ := NoCBundle.empty(TX, TY, config))
+    side.bwdIn.foreach(_ := NoCBundle.empty(TX, TY, config))
+  }
+  tieIn(chips(0).io.west)
+  tieIn(chips(1).io.east)
+  tieIn(chips(0).io.south)
+  tieIn(chips(1).io.north)
 }
 
 class TorusExtensionTester extends AnyFlatSpec with ChiselScalatestTester with Matchers {
@@ -66,6 +85,18 @@ class TorusExtensionTester extends AnyFlatSpec with ChiselScalatestTester with M
     val fwd = if (s <= t) t - s else dim - s + t
     val bwd = dim - fwd
     if (fwd <= bwd) fwd else -bwd
+  }
+
+  /** folded 2-chip chain mapping: global ring index -> (chip, local index).
+    * chip0 holds the first and last quarters of the ring (out-chain cols 0..h-1,
+    * back-chain cols h..n-1), chip1 the middle two quarters.
+    */
+  def gmap(g: Int, n: Int): (Int, Int) = {
+    val h = n / 2
+    if (g < h) (0, g)
+    else if (g < n) (1, g - h)
+    else if (g < n + h) (1, g - n + h)
+    else (0, g - n)
   }
 
   def emptyPkt(dut: TwoChipHarness): NoCBundle =
@@ -139,8 +170,10 @@ class TorusExtensionTester extends AnyFlatSpec with ChiselScalatestTester with M
       for (gsx <- 0 until 2 * D; sy <- 0 until D; gtx <- 0 until 2 * D; ty <- 0 until D
            if (gsx, sy) != (gtx, ty)) {
         n2 += 1
+        val (cs, lx) = gmap(gsx, D)
+        val (cd, tx) = gmap(gtx, D)
         problems ++= sendAndCheck(dut,
-          gsx / D, gsx % D, sy, gtx / D, gtx % D, ty,
+          cs, lx, sy, cd, tx, ty,
           signedHops(gsx, gtx, 2 * D), signedHops(sy, ty, D), (n2 * 11 + 5) & 0xffff)
       }
       info(s"extendX 4x2: $n2 transfers, ${problems.size} problem(s) cumulative")
@@ -152,8 +185,10 @@ class TorusExtensionTester extends AnyFlatSpec with ChiselScalatestTester with M
       for (sx <- 0 until D; gsy <- 0 until 2 * D; tx <- 0 until D; gty <- 0 until 2 * D
            if (sx, gsy) != (tx, gty)) {
         n3 += 1
+        val (cs, ly) = gmap(gsy, D)
+        val (cd, ty) = gmap(gty, D)
         problems ++= sendAndCheck(dut,
-          gsy / D, sx, gsy % D, gty / D, tx, gty % D,
+          cs, sx, ly, cd, tx, ty,
           signedHops(sx, tx, D), signedHops(gsy, gty, 2 * D), (n3 * 13 + 9) & 0xffff)
       }
       info(s"extendY 2x4: $n3 transfers, ${problems.size} problem(s) cumulative")
@@ -175,8 +210,10 @@ class TorusExtensionTester extends AnyFlatSpec with ChiselScalatestTester with M
       for (gsx <- 0 until 2 * D; sy <- 0 until D; gtx <- 0 until 2 * D; ty <- 0 until D
            if (gsx, sy) != (gtx, ty)) {
         n += 1
+        val (cs, lx) = gmap(gsx, D)
+        val (cd, tx) = gmap(gtx, D)
         problems ++= sendAndCheck(dut,
-          gsx / D, gsx % D, sy, gtx / D, gtx % D, ty,
+          cs, lx, sy, cd, tx, ty,
           signedHops(gsx, gtx, 2 * D), signedHops(sy, ty, D), (n * 11 + 5) & 0xffff)
       }
       info(s"extended 8x4: $n transfers; ${problems.size} problem(s)")

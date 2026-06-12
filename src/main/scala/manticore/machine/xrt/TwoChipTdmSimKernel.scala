@@ -119,21 +119,46 @@ class TwoChipTdmSimKernel(
 
   clock_distribution.io.compute_clock_en := chipA.io.clock_active
 
-  val aXb = chipA.xb.get
-  aXb.extendX := true.B
+  // Per-side model: chip A is the WEST chip of a 2-chip X chain. Only its EAST side
+  // extends (one cable to chip B's west); A's west/north/south stay U-turned, making
+  // A hold the global out-chain cols 0..aDimX/2-1 and back-chain cols gDimX-aDimX/2..
+  val aMc = chipA.mc.get
+  aMc.east.extend  := true.B
+  aMc.west.extend  := false.B
+  aMc.north.extend := false.B
+  aMc.south.extend := false.B
+  private def tieMcSide(s: chipA.SideIO): Unit = {
+    s.fwdIn := VecInit(Seq.fill(s.fwdIn.length)(NoCBundle.empty(gDimX, gDimY, ManticoreFullISA)))
+    s.bwdIn := VecInit(Seq.fill(s.bwdIn.length)(NoCBundle.empty(gDimX, gDimY, ManticoreFullISA)))
+  }
+  tieMcSide(aMc.west)
+  tieMcSide(aMc.north)
+  tieMcSide(aMc.south)
 
   // ---------------- Chip B: bare compute array (a second IC) ----------------
   // Same gated compute clock and the same soft reset chip A drives to its own array,
   // so both arrays step in lockstep and reset together.
   val chipB = withClockAndReset(
     clock = clock_distribution.io.compute_clock,
-    reset = aXb.softResetOut
+    reset = aMc.softResetOut
   ) {
     Module(new ComputeArray(bDimX, gDimY, debug_enable = false, enable_custom_alu,
       prefix_path = ".", n_hop = 1, torusDimX = gDimX, torusDimY = gDimY))
   }
 
-  chipB.io.extendX := true.B
+  // chip B is the EAST chip: only its WEST side extends (the cable to A); its east
+  // U-turn is the chain's far turnaround, north/south stay closed.
+  chipB.io.extendWest  := true.B
+  chipB.io.extendEast  := false.B
+  chipB.io.extendNorth := false.B
+  chipB.io.extendSouth := false.B
+  private def tieArrSide(s: manticore.machine.core.SeamSide): Unit = {
+    s.fwdIn := VecInit(Seq.fill(s.nLinks)(NoCBundle.empty(gDimX, gDimY, ManticoreFullISA)))
+    s.bwdIn := VecInit(Seq.fill(s.nLinks)(NoCBundle.empty(gDimX, gDimY, ManticoreFullISA)))
+  }
+  tieArrSide(chipB.io.east)
+  tieArrSide(chipB.io.north)
+  tieArrSide(chipB.io.south)
   // chip B has no local bootloader: it is configured purely by seam-delivered packets.
   chipB.io.config_enable := false.B
   chipB.io.config_packet := NoCBundle.empty(gDimX, gDimY, ManticoreFullISA)
@@ -179,7 +204,7 @@ class TwoChipTdmSimKernel(
   val bootBypass = withClockAndReset(clock_distribution.io.compute_clock, reset) {
     val tailHold = bypassWireLatency + 2 // 24: frame at mux -> presented at demux + 1
     val tail     = RegInit(0.U(log2Ceil(tailHold + 1).W))
-    val bypass   = aXb.configEnableOut || tail =/= 0.U
+    val bypass   = aMc.configEnableOut || tail =/= 0.U
     val anyFrame = bridgeA.io.tx.valid || bridgeB.io.tx.valid
     when(bypass && anyFrame) {
       tail := tailHold.U
@@ -193,16 +218,16 @@ class TwoChipTdmSimKernel(
   bridgeA.io.connected := true.B
   bridgeB.io.connected := true.B
 
-  // array-facing wiring: chip A's seam boundary -> bridgeA, chip B's -> bridgeB
-  bridgeA.io.fwdOut := aXb.fwdOut
-  bridgeA.io.bwdOut := aXb.bwdOut
-  aXb.fwdIn := bridgeA.io.fwdIn
-  aXb.bwdIn := bridgeA.io.bwdIn
+  // array-facing wiring: the cable is A.east <-> B.west, one bridge per end
+  bridgeA.io.fwdOut := aMc.east.fwdOut
+  bridgeA.io.bwdOut := aMc.east.bwdOut
+  aMc.east.fwdIn := bridgeA.io.fwdIn
+  aMc.east.bwdIn := bridgeA.io.bwdIn
 
-  bridgeB.io.fwdOut := chipB.io.xFwdOut
-  bridgeB.io.bwdOut := chipB.io.xBwdOut
-  chipB.io.xFwdIn := bridgeB.io.fwdIn
-  chipB.io.xBwdIn := bridgeB.io.bwdIn
+  bridgeB.io.fwdOut := chipB.io.west.fwdOut
+  bridgeB.io.bwdOut := chipB.io.west.bwdOut
+  chipB.io.west.fwdIn := bridgeB.io.fwdIn
+  chipB.io.west.bwdIn := bridgeB.io.bwdIn
 
   // transceiver model: a fixed-latency TdmFrame pipe each way. The pipe depth depends
   // on whether we are in boot bypass (banks drained immediately, so the wire absorbs

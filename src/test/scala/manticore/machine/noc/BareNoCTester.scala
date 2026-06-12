@@ -156,12 +156,13 @@ class BareNoCTester extends AnyFlatSpec with ChiselScalatestTester with Matchers
   it should "always deliver packets in absence of congestion" taggedAs RequiresVerilator in {
 
 
-    test(new BareNoC(6, 7, ManticoreBaseISA, n_hop = 2))
+    // even dims only: the per-side seam cuts split each ring into two balanced halves
+    test(new BareNoC(6, 8, ManticoreBaseISA, n_hop = 2))
       .withAnnotations(Seq(VerilatorBackendAnnotation)) { implicit dut =>
         checkRoutable
       }
-    
-    test(new BareNoC(6, 7, ManticoreBaseISA, n_hop = 1))
+
+    test(new BareNoC(6, 8, ManticoreBaseISA, n_hop = 1))
       .withAnnotations(Seq(VerilatorBackendAnnotation)) { implicit dut =>
         checkRoutable
       }

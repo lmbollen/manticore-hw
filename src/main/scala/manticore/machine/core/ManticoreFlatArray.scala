@@ -68,6 +68,14 @@ class ClockDistribution extends BlackBox with HasBlackBoxResource {
   addResource("/verilog/ClockDistribution.v")
 }
 
+/** one chip side's seam links: chip egress + ingress for both NoC channels */
+class SeamSide(val nLinks: Int, tX: Int, tY: Int) extends Bundle {
+  val fwdOut = Output(Vec(nLinks, new NoCBundle(tX, tY, ManticoreFullISA)))
+  val fwdIn  = Input(Vec(nLinks, new NoCBundle(tX, tY, ManticoreFullISA)))
+  val bwdOut = Output(Vec(nLinks, new NoCBundle(tX, tY, ManticoreFullISA)))
+  val bwdIn  = Input(Vec(nLinks, new NoCBundle(tX, tY, ManticoreFullISA)))
+}
+
 class ComputeArray(
     dimx: Int,
     dimy: Int,
@@ -87,6 +95,8 @@ class ComputeArray(
   val tX = if (torusDimX > 0) torusDimX else dimx
   val tY = if (torusDimY > 0) torusDimY else dimy
   require(tX >= dimx && tY >= dimy, "torus dims must be >= local array dims")
+  // each ring is cut into two BALANCED halves (per-side extension), so only even dims
+  require(dimx % 2 == 0 && dimy % 2 == 0, "per-side seam cuts need even array dimensions")
 
   val io = IO(new Bundle {
     val mem_access         = Flipped(CacheConfig.frontInterface())
@@ -96,12 +106,23 @@ class ComputeArray(
     val exception_occurred = Output(Bool())
     val dynamic_cycle      = Output(Bool())
     val execution_active   = Output(Bool())
-    // X-dimension torus extension (runtime): false = wrap closed locally (standalone)
-    val extendX = Input(Bool())
-    val xFwdOut = Output(Vec(dimy, new NoCBundle(tX, tY, ManticoreFullISA)))
-    val xFwdIn  = Input(Vec(dimy, new NoCBundle(tX, tY, ManticoreFullISA)))
-    val xBwdOut = Output(Vec(dimy, new NoCBundle(tX, tY, ManticoreFullISA)))
-    val xBwdIn  = Input(Vec(dimy, new NoCBundle(tX, tY, ManticoreFullISA)))
+    // Per-SIDE torus extension (runtime booleans). Each ring is cut TWICE into two
+    // balanced halves (even dims only): the East boundary owns the middle cut
+    // (col dimx/2-1 | dimx/2), the West boundary owns the wrap (col dimx-1 | 0);
+    // North/South likewise for rows. A side is either U-turned locally
+    // (extend=false: TorusBoundary closes the cut — ALL four false is exactly the
+    // standalone torus) or extended to that side's neighbour chip. Chips chained
+    // this way fold the global ring through each chip (out-chain = first half,
+    // back-chain = second half), so every cable is neighbour-to-neighbour and the
+    // END chips of a chain simply close their outer sides — no global wrap cable.
+    val extendEast  = Input(Bool())
+    val extendWest  = Input(Bool())
+    val extendNorth = Input(Bool())
+    val extendSouth = Input(Bool())
+    val east  = new SeamSide(dimy, tX, tY)
+    val west  = new SeamSide(dimy, tX, tY)
+    val north = new SeamSide(dimx, tX, tY)
+    val south = new SeamSide(dimx, tX, tY)
     // val core_reset_done    = Output(Bool())
   })
 
@@ -158,42 +179,75 @@ class ComputeArray(
     }
   }
 
-  // The X wrap links pass through a TorusBoundary: closed locally by default
-  // (standalone torus, identical to the old hard wrap), or handed to a neighbouring
-  // chip via the io.x* ports when extendX is set at runtime.
-  val xBoundary = Module(new TorusBoundary(dimy, tX, tY, ManticoreFullISA))
-  xBoundary.io.extend := io.extendX
+  // Four per-side boundaries, each owning one of the two cuts of its dimension's
+  // rings. East = the MIDDLE cut (between the out-chain cols 0..h-1 and the
+  // back-chain cols h..dimx-1); West = the WRAP cut (col dimx-1 | col 0). Closed,
+  // they restore exactly the middle link / the wrap, so all-closed == plain torus.
+  // North/South mirror this for rows (v = dimy/2).
+  private val h = dimx / 2
+  private val v = dimy / 2
+
+  val eastBoundary  = Module(new TorusBoundary(dimy, tX, tY, ManticoreFullISA))
+  val westBoundary  = Module(new TorusBoundary(dimy, tX, tY, ManticoreFullISA))
+  val northBoundary = Module(new TorusBoundary(dimx, tX, tY, ManticoreFullISA))
+  val southBoundary = Module(new TorusBoundary(dimx, tX, tY, ManticoreFullISA))
+  eastBoundary.io.extend  := io.extendEast
+  westBoundary.io.extend  := io.extendWest
+  northBoundary.io.extend := io.extendNorth
+  southBoundary.io.extend := io.extendSouth
+
   Range(0, dimy).foreach { y =>
-    xBoundary.io.wrapFwdIn(y) := cores(dimx - 1)(y).switch.io.xOutput
-    xBoundary.io.wrapBwdIn(y) := cores(0)(y).switch.io.xNegOutput
+    // middle cut: out-chain end (col h-1) <-> back-chain start (col h)
+    eastBoundary.io.wrapFwdIn(y) := cores(h - 1)(y).switch.io.xOutput
+    eastBoundary.io.wrapBwdIn(y) := cores(h)(y).switch.io.xNegOutput
+    // wrap cut: back-chain end (col dimx-1) <-> out-chain start (col 0)
+    westBoundary.io.wrapFwdIn(y) := cores(dimx - 1)(y).switch.io.xOutput
+    westBoundary.io.wrapBwdIn(y) := cores(0)(y).switch.io.xNegOutput
   }
-  io.xFwdOut := xBoundary.io.extFwdOut
-  xBoundary.io.extFwdIn := io.xFwdIn
-  io.xBwdOut := xBoundary.io.extBwdOut
-  xBoundary.io.extBwdIn := io.xBwdIn
+  Range(0, dimx).foreach { x =>
+    northBoundary.io.wrapFwdIn(x) := cores(x)(v - 1).switch.io.yOutput
+    northBoundary.io.wrapBwdIn(x) := cores(x)(v).switch.io.yNegOutput
+    southBoundary.io.wrapFwdIn(x) := cores(x)(dimy - 1).switch.io.yOutput
+    southBoundary.io.wrapBwdIn(x) := cores(x)(0).switch.io.yNegOutput
+  }
+
+  def hookSide(side: SeamSide, b: TorusBoundary): Unit = {
+    side.fwdOut := b.io.extFwdOut
+    b.io.extFwdIn := side.fwdIn
+    side.bwdOut := b.io.extBwdOut
+    b.io.extBwdIn := side.bwdIn
+  }
+  hookSide(io.east, eastBoundary)
+  hookSide(io.west, westBoundary)
+  hookSide(io.north, northBoundary)
+  hookSide(io.south, southBoundary)
 
   // connect the cores via switches
   Range(0, dimx).foreach { x =>
     Range(0, dimy).foreach { y =>
-      // Eastbound (+X): packet from x-1 enters this switch; wrap via the boundary
+      // Eastbound (+X): packet from x-1 enters this switch; cuts via the boundaries
       cores(x)(y).switch.io.xInput := {
-        if (x == 0) xBoundary.io.wrapFwdOut(y)
-        else        cores(x - 1)(y).switch.io.xOutput
+        if (x == 0)      westBoundary.io.wrapFwdOut(y) // out-chain start
+        else if (x == h) eastBoundary.io.wrapFwdOut(y) // back-chain start
+        else             cores(x - 1)(y).switch.io.xOutput
       }
-      // Westbound (-X): packet from x+1 enters this switch; wrap via the boundary
+      // Westbound (-X): packet from x+1 enters this switch
       cores(x)(y).switch.io.xNegInput := {
-        if (x == dimx - 1) xBoundary.io.wrapBwdOut(y)
-        else                cores(x + 1)(y).switch.io.xNegOutput
+        if (x == dimx - 1)   westBoundary.io.wrapBwdOut(y)
+        else if (x == h - 1) eastBoundary.io.wrapBwdOut(y)
+        else                 cores(x + 1)(y).switch.io.xNegOutput
       }
-      // Northbound (+Y): packet from y-1 enters this switch; wrap from dimy-1 to 0
+      // Northbound (+Y)
       cores(x)(y).switch.io.yInput := {
-        if (y == 0) cores(x)(dimy - 1).switch.io.yOutput
-        else        cores(x)(y - 1).switch.io.yOutput
+        if (y == 0)      southBoundary.io.wrapFwdOut(x)
+        else if (y == v) northBoundary.io.wrapFwdOut(x)
+        else             cores(x)(y - 1).switch.io.yOutput
       }
-      // Southbound (-Y): packet from y+1 enters this switch; wrap from 0 to dimy-1
+      // Southbound (-Y)
       cores(x)(y).switch.io.yNegInput := {
-        if (y == dimy - 1) cores(x)(0).switch.io.yNegOutput
-        else                cores(x)(y + 1).switch.io.yNegOutput
+        if (y == dimy - 1)   southBoundary.io.wrapBwdOut(x)
+        else if (y == v - 1) northBoundary.io.wrapBwdOut(x)
+        else                 cores(x)(y + 1).switch.io.yNegOutput
       }
 
       if (debug_enable) {
@@ -278,18 +332,26 @@ class ManticoreFlatArray(
 
   val io = IO(new ManticoreFlatArrayInterface)
 
-  /** multi-chip boundary IO (present only when torus dims are set) */
-  class XBoundaryIO extends Bundle {
-    val extendX = Input(Bool())
-    val fwdOut  = Output(Vec(dimy, new NoCBundle(tX, tY, ManticoreFullISA)))
-    val fwdIn   = Input(Vec(dimy, new NoCBundle(tX, tY, ManticoreFullISA)))
-    val bwdOut  = Output(Vec(dimy, new NoCBundle(tX, tY, ManticoreFullISA)))
-    val bwdIn   = Input(Vec(dimy, new NoCBundle(tX, tY, ManticoreFullISA)))
-    // system-composition signals the harness needs to run a secondary (compute-only) chip
-    val softResetOut    = Output(Bool()) // controller's soft reset (drives the other chip's array)
+  /** multi-chip boundary IO (present only when torus dims are set): four independent
+    * seam sides + the system-composition signals secondary chips/bridges need
+    */
+  class SideIO(n: Int) extends Bundle {
+    val extend = Input(Bool())
+    val fwdOut = Output(Vec(n, new NoCBundle(tX, tY, ManticoreFullISA)))
+    val fwdIn  = Input(Vec(n, new NoCBundle(tX, tY, ManticoreFullISA)))
+    val bwdOut = Output(Vec(n, new NoCBundle(tX, tY, ManticoreFullISA)))
+    val bwdIn  = Input(Vec(n, new NoCBundle(tX, tY, ManticoreFullISA)))
+  }
+  class MultiChipIO extends Bundle {
+    val east  = new SideIO(dimy)
+    val west  = new SideIO(dimy)
+    val north = new SideIO(dimx)
+    val south = new SideIO(dimx)
+    // system-composition signals the harness needs to run secondary (compute-only) chips
+    val softResetOut    = Output(Bool()) // controller's soft reset (drives the other chips' arrays)
     val configEnableOut = Output(Bool()) // boot window (drives the TDM bridges' bypass)
   }
-  val xb: Option[XBoundaryIO] = if (multiChip) Some(IO(new XBoundaryIO)) else None
+  val mc: Option[MultiChipIO] = if (multiChip) Some(IO(new MultiChipIO)) else None
 
   val controller = withClockAndReset(
     reset = io.reset,
@@ -385,26 +447,36 @@ class ManticoreFlatArray(
   controller.io.core_kill_clock := compute_array.io.dynamic_cycle
   controller.io.cache_done      := io.memory_backend.done
 
-  // X seam boundary: standalone closes the ring inside ComputeArray (extendX=false,
-  // empty ingress). Multi-chip exposes the cut links + control signals to the harness.
-  xb match {
+  // Seam boundaries: standalone closes all four cuts inside ComputeArray
+  // (extend=false, empty ingress). Multi-chip exposes the sides to the harness.
+  private def tieOffSide(extend: Bool, side: SeamSide): Unit = {
+    extend := false.B
+    val empty = Wire(new NoCBundle(tX, tY, ManticoreFullISA))
+    empty := DontCare
+    empty.valid := false.B
+    side.fwdIn := VecInit(Seq.fill(side.nLinks)(empty))
+    side.bwdIn := VecInit(Seq.fill(side.nLinks)(empty))
+  }
+  private def passSide(extend: Bool, inner: SeamSide, outer: SideIO): Unit = {
+    extend := outer.extend
+    outer.fwdOut := inner.fwdOut
+    outer.bwdOut := inner.bwdOut
+    inner.fwdIn := outer.fwdIn
+    inner.bwdIn := outer.bwdIn
+  }
+  mc match {
     case Some(b) =>
-      compute_array.io.extendX := b.extendX
-      b.fwdOut := compute_array.io.xFwdOut
-      b.bwdOut := compute_array.io.xBwdOut
-      compute_array.io.xFwdIn := b.fwdIn
-      compute_array.io.xBwdIn := b.bwdIn
+      passSide(compute_array.io.extendEast, compute_array.io.east, b.east)
+      passSide(compute_array.io.extendWest, compute_array.io.west, b.west)
+      passSide(compute_array.io.extendNorth, compute_array.io.north, b.north)
+      passSide(compute_array.io.extendSouth, compute_array.io.south, b.south)
       b.softResetOut    := controller.io.soft_reset
       b.configEnableOut := controller.io.config_enable
     case None =>
-      compute_array.io.extendX := false.B
-      val empty = Wire(new NoCBundle(tX, tY, ManticoreFullISA))
-      empty := DontCare
-      empty.valid := false.B
-      Range(0, dimy).foreach { y =>
-        compute_array.io.xFwdIn(y) := empty
-        compute_array.io.xBwdIn(y) := empty
-      }
+      tieOffSide(compute_array.io.extendEast, compute_array.io.east)
+      tieOffSide(compute_array.io.extendWest, compute_array.io.west)
+      tieOffSide(compute_array.io.extendNorth, compute_array.io.north)
+      tieOffSide(compute_array.io.extendSouth, compute_array.io.south)
   }
 
 }

@@ -16,23 +16,28 @@ class BareNoCInterface(DimX: Int, DimY: Int, config: ISA, bX: Int = 0, bY: Int =
   val configPacket: NoCBundle = Input(new NoCBundle(tX, tY, config))
   val configEnable: Bool = Input(Bool())
 
-  // Torus extension (see TorusBoundary): each ring of a dimension is cut into a
-  // line whose two directed strings (fwd/bwd) end at a boundary router. With
-  // extendX/extendY = false (default) the boundary reconnects the strings — the
-  // standalone single-torus behaviour. With extend = true the strings are routed
-  // through these ports instead; cross-connecting two instances (fwd<->fwd,
-  // bwd<->bwd) forms one torus of twice the extent in that dimension.
-  val extendX: Bool = Input(Bool())
-  val xFwdOut: Vec[NoCBundle] = Output(Vec(DimY, new NoCBundle(tX, tY, config)))
-  val xFwdIn: Vec[NoCBundle]  = Input(Vec(DimY, new NoCBundle(tX, tY, config)))
-  val xBwdOut: Vec[NoCBundle] = Output(Vec(DimY, new NoCBundle(tX, tY, config)))
-  val xBwdIn: Vec[NoCBundle]  = Input(Vec(DimY, new NoCBundle(tX, tY, config)))
+  // Per-SIDE torus extension (see TorusBoundary and ComputeArray): each ring is cut
+  // TWICE into two balanced halves (even dims only) — East owns the middle cut
+  // (col DimX/2-1 | DimX/2), West the wrap (col DimX-1 | 0); North/South likewise.
+  // extend<Side>=false U-turns that side locally (all four false == plain torus);
+  // true hands the cut to the neighbouring instance. Chains of chips fold the global
+  // ring through each chip, so all cables are neighbour-to-neighbour and the end
+  // chips of a chain close their outer sides.
+  val extendEast: Bool  = Input(Bool())
+  val extendWest: Bool  = Input(Bool())
+  val extendNorth: Bool = Input(Bool())
+  val extendSouth: Bool = Input(Bool())
 
-  val extendY: Bool = Input(Bool())
-  val yFwdOut: Vec[NoCBundle] = Output(Vec(DimX, new NoCBundle(tX, tY, config)))
-  val yFwdIn: Vec[NoCBundle]  = Input(Vec(DimX, new NoCBundle(tX, tY, config)))
-  val yBwdOut: Vec[NoCBundle] = Output(Vec(DimX, new NoCBundle(tX, tY, config)))
-  val yBwdIn: Vec[NoCBundle]  = Input(Vec(DimX, new NoCBundle(tX, tY, config)))
+  class Side(n: Int) extends Bundle {
+    val fwdOut: Vec[NoCBundle] = Output(Vec(n, new NoCBundle(tX, tY, config)))
+    val fwdIn: Vec[NoCBundle]  = Input(Vec(n, new NoCBundle(tX, tY, config)))
+    val bwdOut: Vec[NoCBundle] = Output(Vec(n, new NoCBundle(tX, tY, config)))
+    val bwdIn: Vec[NoCBundle]  = Input(Vec(n, new NoCBundle(tX, tY, config)))
+  }
+  val east  = new Side(DimY)
+  val west  = new Side(DimY)
+  val north = new Side(DimX)
+  val south = new Side(DimX)
 }
 
 /**
@@ -42,16 +47,19 @@ class BareNoCInterface(DimX: Int, DimY: Int, config: ISA, bX: Int = 0, bY: Int =
  * @param config
  * @param n_hop      pipeline registers per hop
  * @param torusDimX  GLOBAL torus width for hop-field sizing (0 = DimX, standalone).
- *                   Set to e.g. 2*DimX when two instances are chained via extendX.
- * @param torusDimY  ditto for Y (Y extension not yet wired — symmetric, add when needed)
+ * @param torusDimY  ditto for Y
  */
 class BareNoC(DimX: Int, DimY: Int, config: ISA, val n_hop: Int = 2, torusDimX: Int = 0, torusDimY: Int = 0) extends Module {
 
   private val tX = if (torusDimX > 0) torusDimX else DimX
   private val tY = if (torusDimY > 0) torusDimY else DimY
   require(tX >= DimX && tY >= DimY, "torus dims must be >= local array dims")
+  require(DimX % 2 == 0 && DimY % 2 == 0, "per-side seam cuts need even array dimensions")
 
   val io = IO(new BareNoCInterface(DimX, DimY, config, tX, tY))
+
+  private val h = DimX / 2
+  private val v = DimY / 2
 
   // Switches take dims ONLY for NoCBundle sizing — routing is purely relative
   // (signed hops moved toward zero), so a local switch works unchanged as a
@@ -62,70 +70,71 @@ class BareNoC(DimX: Int, DimY: Int, config: ISA, val n_hop: Int = 2, torusDimX: 
     }
   }
 
-  // connect the row ports in the switches
-  // Eastbound (+X): packet from left enters switch's xInput. The wrap link
-  // (rightmost → leftmost) goes through the TorusBoundary so it can be opened
-  // toward a neighbouring instance (extendX) or closed locally (default).
-  val xBoundary = Module(new TorusBoundary(DimY, tX, tY, config))
-  xBoundary.io.extend := io.extendX
+  val eastBoundary  = Module(new TorusBoundary(DimY, tX, tY, config))
+  val westBoundary  = Module(new TorusBoundary(DimY, tX, tY, config))
+  val northBoundary = Module(new TorusBoundary(DimX, tX, tY, config))
+  val southBoundary = Module(new TorusBoundary(DimX, tX, tY, config))
+  eastBoundary.io.extend  := io.extendEast
+  westBoundary.io.extend  := io.extendWest
+  northBoundary.io.extend := io.extendNorth
+  southBoundary.io.extend := io.extendSouth
 
-  switch_array.transpose.zipWithIndex.foreach { case (row, y) =>
-    xBoundary.io.wrapFwdIn(y) := row.last.io.xOutput
-    row.head.io.xInput := xBoundary.io.wrapFwdOut(y)
-    row.sliding(2, 1).foreach { case Seq(left: Switch, right: Switch) =>
-      right.io.xInput := left.io.xOutput
-    }
+  Range(0, DimY).foreach { y =>
+    eastBoundary.io.wrapFwdIn(y) := switch_array(h - 1)(y).io.xOutput
+    eastBoundary.io.wrapBwdIn(y) := switch_array(h)(y).io.xNegOutput
+    westBoundary.io.wrapFwdIn(y) := switch_array(DimX - 1)(y).io.xOutput
+    westBoundary.io.wrapBwdIn(y) := switch_array(0)(y).io.xNegOutput
+  }
+  Range(0, DimX).foreach { x =>
+    northBoundary.io.wrapFwdIn(x) := switch_array(x)(v - 1).io.yOutput
+    northBoundary.io.wrapBwdIn(x) := switch_array(x)(v).io.yNegOutput
+    southBoundary.io.wrapFwdIn(x) := switch_array(x)(DimY - 1).io.yOutput
+    southBoundary.io.wrapBwdIn(x) := switch_array(x)(0).io.yNegOutput
   }
 
-  // Westbound (-X): packet from right enters switch's xNegInput; wrap
-  // (leftmost → rightmost) also via the boundary.
-  switch_array.transpose.zipWithIndex.foreach { case (row, y) =>
-    xBoundary.io.wrapBwdIn(y) := row.head.io.xNegOutput
-    row.last.io.xNegInput := xBoundary.io.wrapBwdOut(y)
-    row.sliding(2, 1).foreach { case Seq(left: Switch, right: Switch) =>
-      left.io.xNegInput := right.io.xNegOutput
+  private def hook(side: BareNoCInterface#Side, b: TorusBoundary): Unit = {
+    side.fwdOut := b.io.extFwdOut
+    b.io.extFwdIn := side.fwdIn
+    side.bwdOut := b.io.extBwdOut
+    b.io.extBwdIn := side.bwdIn
+  }
+  hook(io.east, eastBoundary)
+  hook(io.west, westBoundary)
+  hook(io.north, northBoundary)
+  hook(io.south, southBoundary)
+
+  Range(0, DimX).foreach { x =>
+    Range(0, DimY).foreach { y =>
+      // Eastbound (+X)
+      switch_array(x)(y).io.xInput := {
+        if (x == 0)      westBoundary.io.wrapFwdOut(y)
+        else if (x == h) eastBoundary.io.wrapFwdOut(y)
+        else             switch_array(x - 1)(y).io.xOutput
+      }
+      // Westbound (-X)
+      switch_array(x)(y).io.xNegInput := {
+        if (x == DimX - 1)   westBoundary.io.wrapBwdOut(y)
+        else if (x == h - 1) eastBoundary.io.wrapBwdOut(y)
+        else                 switch_array(x + 1)(y).io.xNegOutput
+      }
+      // Northbound (+Y)
+      switch_array(x)(y).io.yInput := {
+        if (y == 0)      southBoundary.io.wrapFwdOut(x)
+        else if (y == v) northBoundary.io.wrapFwdOut(x)
+        else             switch_array(x)(y - 1).io.yOutput
+      }
+      // Southbound (-Y)
+      switch_array(x)(y).io.yNegInput := {
+        if (y == DimY - 1)   southBoundary.io.wrapBwdOut(x)
+        else if (y == v - 1) northBoundary.io.wrapBwdOut(x)
+        else                 switch_array(x)(y + 1).io.yNegOutput
+      }
     }
   }
-
-  io.xFwdOut := xBoundary.io.extFwdOut
-  xBoundary.io.extFwdIn := io.xFwdIn
-  io.xBwdOut := xBoundary.io.extBwdOut
-  xBoundary.io.extBwdIn := io.xBwdIn
 
   when(io.configEnable) {
     switch_array.head.head.io.xInput := io.configPacket
   }
-
-  // connect column ports of the switches — Y wrap links also via a TorusBoundary.
-  // Note: the topmost yOutput carries terminal deliveries too (valid=false packets
-  // with the terminal flag); they are ignored by any downstream yInput handler, so
-  // forwarding them through the boundary (or off-chip) is harmless.
-  val yBoundary = Module(new TorusBoundary(DimX, tX, tY, config))
-  yBoundary.io.extend := io.extendY
-
-  // Northbound (+Y): packet from below enters switch's yInput; wrap: topmost → bottommost
-  switch_array.zipWithIndex.foreach { case (col, x) =>
-    yBoundary.io.wrapFwdIn(x) := col.last.io.yOutput
-    col.head.io.yInput := yBoundary.io.wrapFwdOut(x)
-    col.sliding(2, 1).foreach { case Seq(top: Switch, bot: Switch) =>
-      bot.io.yInput := top.io.yOutput
-    }
-  }
-
-  // Southbound (-Y): packet from above enters switch's yNegInput; wrap: bottommost → topmost
-  switch_array.zipWithIndex.foreach { case (col, x) =>
-    yBoundary.io.wrapBwdIn(x) := col.head.io.yNegOutput
-    col.last.io.yNegInput := yBoundary.io.wrapBwdOut(x)
-    col.sliding(2, 1).foreach { case Seq(top: Switch, bot: Switch) =>
-      top.io.yNegInput := bot.io.yNegOutput
-    }
-  }
-
-  io.yFwdOut := yBoundary.io.extFwdOut
-  yBoundary.io.extFwdIn := io.yFwdIn
-  io.yBwdOut := yBoundary.io.extBwdOut
-  yBoundary.io.extBwdIn := io.yBwdIn
-
 
   // connect ios
   switch_array.flatten.

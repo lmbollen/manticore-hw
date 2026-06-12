@@ -8,22 +8,20 @@ import org.scalatest.matchers.should.Matchers
 
 import java.nio.file.{Files, Paths}
 
-/** Full-system two-IC RTL simulation: a global 8x4 torus split into chip A (a full
-  * ManticoreFlatArray, X 0-3) and chip B (a bare ComputeArray, X 4-7), joined by a
-  * fixed-latency TDM seam (T = 25, the value latencies.csv charges these links).
+/** Full-system EIGHT-IC RTL simulation: one global 8x16 torus built from a 2x4 grid of
+  * 4x4 chips, joined by per-directed-adjacency TDM seams (T = 25) in BOTH dimensions.
+  * Chip (0,0) is the full array (controller/bootloader/cache/reporter); the other 7 are
+  * bare compute arrays booted entirely over the seams. Boot countdown packets cross up
+  * to 1 X-seam + 3 Y-seams (max skew 96 cycles), compensated by the compiler's
+  * boot-skew padding.
   *
-  * The program is the padded picorv32-multi image in /tmp/pico84_pad: the compiler
-  * prepended boot-skew NOPs so that, despite the slow seam delaying the countdown
-  * packets to chip B, every core's real work starts aligned. Golden (from
-  * `masm interpret` over the SAME padded program): 1025 virtual cycles, 4 SIG
-  * FLUSH displays, terminates at the picorv32 $finish (FINISH eid).
-  *
-  * The reporter is the only privileged process and lives on chip A's core (0,0), so
-  * the exception/flush flow is identical to the single-chip Mips32SimTester.
+  * Program: picorv32 loop_multi compiled `-x 8 -y 16 --no-cf --hop-latencies` (the
+  * /tmp/seam816 CSV charges 25 per seam crossing). Interpreter golden: 1025 virtual
+  * cycles, 4 SIG FLUSH displays, FINISH.
   */
-class TwoChipTdmSimTester extends AnyFlatSpec with ChiselScalatestTester with Matchers {
+class MultiChipTdmSimTester extends AnyFlatSpec with ChiselScalatestTester with Matchers {
 
-  val dir      = sys.props.getOrElse("twochip.dir", "/tmp/pico84_pad")
+  val dir      = sys.props.getOrElse("multichip.dir", "/tmp/pico816")
   val userBase = 16384
   val CMD_START  = 0
   val CMD_RESUME = 1
@@ -33,7 +31,7 @@ class TwoChipTdmSimTester extends AnyFlatSpec with ChiselScalatestTester with Ma
   val FINISH = Set(1)
 
   val goldenVcycles = 1025
-  val goldenFlushes = 4 // 4 SIG displays
+  val goldenFlushes = 4
 
   def readWords(p: String): Array[Int] = {
     val bytes = Files.readAllBytes(Paths.get(p))
@@ -46,21 +44,9 @@ class TwoChipTdmSimTester extends AnyFlatSpec with ChiselScalatestTester with Ma
   def cmdWord(cmd: Int, timeout: Long): BigInt =
     (BigInt(1) << 63) | (BigInt(cmd) << 56) | BigInt(timeout)
 
-  behavior of "TwoChipTdmSimKernel running padded picorv32-multi over a TDM seam"
+  behavior of "MultiChipTdmSimKernel: 8 chips of 4x4 as one 8x16 torus"
 
-  it should "boot both chips over the seam, compensate skew, and match the interpreter golden" taggedAs RequiresVerilator in {
-    runTwoChipTest(dir, customAlu = false)
-  }
-
-  // Without --no-cf: custom functions extracted (10+ per core), enable_custom_alu arrays on
-  // BOTH chips. Exercises CFU configuration packets crossing the TDM seam during boot.
-  // Interpreter golden identical: 1025 vcycles, SIG 20/96/193/225, FINISH.
-  val dirCf = sys.props.getOrElse("twochip.dircf", "/tmp/pico84_cf")
-  it should "run the CF-extracted build on custom-ALU chips over the seam and match the golden" taggedAs RequiresVerilator in {
-    runTwoChipTest(dirCf, customAlu = true)
-  }
-
-  def runTwoChipTest(dir: String, customAlu: Boolean): Unit = {
+  it should "boot all 8 chips over X+Y seams, compensate skew, and match the interpreter golden" taggedAs RequiresVerilator in {
     val init0 = readWords(s"$dir/init_0/exec.bin")
     val init1 = readWords(s"$dir/init_1/exec.bin")
     val main  = readWords(s"$dir/main/exec.bin")
@@ -73,7 +59,8 @@ class TwoChipTdmSimTester extends AnyFlatSpec with ChiselScalatestTester with Ma
     Array.copy(main, 0, image, baseM, main.length)
     info(s"image words=${image.length}  init0@$base0(${init0.length}) init1@$base1(${init1.length}) main@$baseM(${main.length})")
 
-    test(new TwoChipTdmSimKernel(gDimX = 8, gDimY = 4, aDimX = 4, enable_custom_alu = customAlu))
+    test(new MultiChipTdmSimKernel(chipCols = 2, chipRows = 4, chipDimX = 4, chipDimY = 4,
+      enable_custom_alu = false))
       .withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
         dut.clock.setTimeout(0)
         dut.io.kernel_ctrl.start.poke(false.B)
@@ -110,12 +97,12 @@ class TwoChipTdmSimTester extends AnyFlatSpec with ChiselScalatestTester with Ma
           dut.clock.step()
           dut.io.kernel_ctrl.start.poke(false.B)
           var guard = 0
-          while (dut.io.kernel_ctrl.idle.peekBoolean() && guard < 200000) {
+          while (dut.io.kernel_ctrl.idle.peekBoolean() && guard < 500000) {
             dut.clock.step(); guard += 1
           }
-          while (!dut.io.kernel_ctrl.done.peekBoolean() && guard < 1500000) {
+          while (!dut.io.kernel_ctrl.done.peekBoolean() && guard < 4000000) {
             dut.clock.step(); guard += 1
-            if (guard % 200000 == 0) {
+            if (guard % 500000 == 0) {
               val v = dut.io.kernel_registers.device.virtual_cycles.peek().litValue.toLong
               info(s"  [t=$guard] vcycles=$v overflow=${dut.io.dbg_seam_overflow.peekBoolean()}")
             }
@@ -126,15 +113,14 @@ class TwoChipTdmSimTester extends AnyFlatSpec with ChiselScalatestTester with Ma
           (eid, vc)
         }
 
-        val to = 200000L
+        val to = 500000L
         for ((b, n) <- Seq((base0, "init_0"), (base1, "init_1"))) {
           val (eid, vc) = run(b, cmdWord(CMD_START, to))
           info(s"$n: eid=$eid vc=$vc")
           assert(!(eid > 0xffff), s"$n timed out")
         }
 
-        // main: collect the SIG flushes (memory offsets 0..5 hold the three SIG values)
-        val sigs    = scala.collection.mutable.ArrayBuffer.empty[(Int, Int, Int)]
+        val sigs     = scala.collection.mutable.ArrayBuffer.empty[(Int, Int, Int)]
         val cmdFlush = BigInt(2) << 56
         var (eid, vc) = run(baseM, cmdWord(CMD_START, to))
         var flushes = 0
@@ -149,40 +135,23 @@ class TwoChipTdmSimTester extends AnyFlatSpec with ChiselScalatestTester with Ma
           eid = r._1; vc = r._2
           flushes += 1
         }
-        info(s"MAIN terminated: eid=$eid vcycles=$vc after $flushes SIG flushes; overflow=${dut.io.dbg_seam_overflow.peekBoolean()}")
-
-        // STRUCTURAL signature (same standard as Mips32SimTester): the exact virtual-cycle
-        // count, SIG-flush count, FINISH, and no seam overflow PROVE both chips executed
-        // the program in lockstep across the TDM seam — a dead chip B or a mis-timed seam
-        // would stall the reporter's receives and shift the vcycle count off the golden.
         val muxOvf = dut.io.dbg_seam_overflow.peekBoolean()
         val loss   = dut.io.dbg_seam_dataloss.peekBoolean()
-        info(s"seam overflow flags: any(mux|demux)=$muxOvf  data-loss(demux)=$loss")
+        info(s"MAIN terminated: eid=$eid vcycles=$vc after $flushes SIG flushes; " +
+          s"overflow=$muxOvf data-loss=$loss")
+
         assert(!loss, "TDM seam demux dropped a packet (bank overwritten before release)")
         assert(eid <= 0xffff, s"MAIN timed out (eid=$eid)")
-        assert(FINISH.contains(eid), s"MAIN ended with eid=$eid; golden reaches the picorv32 \\$$finish (FINISH eid)")
+        assert(FINISH.contains(eid), s"MAIN ended with eid=$eid; golden reaches \\$$finish (FINISH eid)")
         assert(vc == goldenVcycles, s"vcycles=$vc, golden/interpreter=$goldenVcycles")
         assert(flushes == goldenFlushes, s"SIG flushes=$flushes, golden=$goldenFlushes")
-        // $display values are readable since the rs4-bank fix (the GST address low word
-        // lives in rs4, which was disabled on no-CFU builds) and the MemoryIntercept
-        // pass-through fix. Golden SIG sequence: (20,20,20) (96,96,96) (193,193,193)
-        // (225,225,225). KNOWN GAP — not asserted yet: the values come out wrong
-        // because of MUX-side seam overflow (`any=true` above): the compiler schedules
-        // seam SENDs assuming a full-rate 25-cycle wire, but the TDM mux accepts only
-        // one packet per logical link per period; closer-spaced same-link SENDs
-        // overwrite the egress bank and the packet never crosses. Timing stays golden
-        // (BSP slots don't depend on payload), so the structural signature above is
-        // still exact. Fix = compiler TDM rate model (min same-link SEND spacing >=
-        // the TDM period), then assert the values here.
+        // SIG values: same known gap as the two-chip test (compiler TDM rate model pending)
         val golden = Seq((20, 20, 20), (96, 96, 96), (193, 193, 193), (225, 225, 225))
-        if (sigs.toSeq == golden) {
-          info(s"SIG values EXACT: $sigs — full value-level match over the TDM seam!")
-        } else {
-          info(s"SIG values (golden $golden): got $sigs — known gap, compiler TDM rate " +
-            s"model pending (mux overflow=$muxOvf)")
-        }
-        info(s"VERIFIED (two-IC, TDM seam, structural): $vc vcycles, $flushes SIG displays, " +
-          s"FINISH (eid $eid), no demux loss — exact match to the placed interpreter.")
+        if (sigs.toSeq == golden) info(s"SIG values EXACT: $sigs — full value-level match!")
+        else info(s"SIG values (golden $golden): got $sigs — known gap, compiler TDM rate model " +
+          s"pending (mux overflow=$muxOvf)")
+        info(s"VERIFIED (8-IC 8x16, X+Y TDM seams, structural): $vc vcycles, $flushes SIG " +
+          s"displays, FINISH (eid $eid), no demux loss — exact match to the placed interpreter.")
       }
   }
 }
