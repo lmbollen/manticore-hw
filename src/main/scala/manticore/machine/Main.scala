@@ -110,8 +110,8 @@ object Main {
         checkConfig { c =>
           if (!c.do_placement) {
             c.target match {
-              case _ @("hw" | "hw_emu" | "sim" | "kcu105") => success
-              case t @ _                                   => failure(s"invalid target ${t}")
+              case _ @("hw" | "hw_emu" | "sim" | "kcu105" | "bittide") => success
+              case t @ _                                               => failure(s"invalid target ${t}")
             }
           } else {
             success
@@ -246,6 +246,30 @@ object Main {
             enable_custom_alu = cfg.enable_custom_alu,
             freqMhz = cfg.freq,
             n_hop = cfg.n_hop
+          )
+
+        case "bittide" =>
+          // Per-chip top for the bittide demo rig (wrapped by a Clash inst
+          // blackbox inside a WireDemo UserCore). Flat pins, no MMCM, gmem on
+          // an internal fixed-latency BRAM. -Dmanticore.no_uram=true required
+          // for the KCU105 rig (xcku040 has no URAM).
+          Console.println(
+            s"Starting bittide chip RTL generation (${cfg.dimx}x${cfg.dimy})"
+          )
+          new ChiselStage().emitVerilog(
+            new manticore.machine.xrt.ManticoreBittideChip(
+              DimX = cfg.dimx,
+              DimY = cfg.dimy,
+              enable_custom_alu = cfg.enable_custom_alu,
+              debug_enable = false,
+              n_hop = cfg.n_hop
+            ),
+            Array(
+              "--target-dir",
+              cfg.output.toPath.toString,
+              "--no-dedup",
+              "--emission-options=disableMemRandomization,disableRegisterRandomization"
+            )
           )
 
         case "sim" =>
