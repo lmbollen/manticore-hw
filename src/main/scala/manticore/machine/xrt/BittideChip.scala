@@ -35,10 +35,10 @@ class ClockDistributionNoMmcm extends BlackBox with HasBlackBoxResource {
   *     on it directly (no MMCM), the core array on a BUFGCE child of it.
   *   - host registers / start / done / idle replace the AXI-Lite slave: the
   *     management-unit CPU drives them through wishbone registers.
-  *   - the DMI port is the host window into the chip-local gmem BRAM (program
-  *     image load + trace readback), same contract as the sim kernels:
-  *     writes commit on the edge, reads are registered (1 cycle), Bittide
-  *     clock domain.
+  *   - the gmem host port (port A) is a raw 32-bit byte-write-enabled BRAM
+  *     port: the host window into the chip-local gmem (program image load +
+  *     trace readback). The Clash user core maps a management-unit Wishbone
+  *     memory region onto it so GDB can bulk-transfer, Bittide clock domain.
   *
   * gmem = TrueDualPortBram inside the chip (fixed-latency, no cache, no
   * clock-kill: see GmemBramBackend). `gmemAddrBits` in 16-bit words.
@@ -62,10 +62,18 @@ class ManticoreBittideChip(
   val ctrl_idle    = IO(Output(Bool()))
   val clock_active = IO(Output(Bool())) // diagnostics: compute clock enabled
 
-  val dmi_addr  = IO(Input(UInt(64.W)))
-  val dmi_wdata = IO(Input(UInt(16.W)))
-  val dmi_wen   = IO(Input(Bool()))
-  val dmi_rdata = IO(Output(UInt(16.W)))
+  // Host window into the chip-local gmem BRAM, exposed as a raw 32-bit
+  // byte-write-enabled BRAM port (port A). The demo's Clash user core maps a
+  // management-unit Wishbone memory region onto this port (via
+  // `addressableBytesWb` + a small ReqResp bridge), so GDB can bulk-write the
+  // program image and bulk-read the trace instead of poking one 16-bit word
+  // per JTAG round-trip. Runs on `control_clock` (= the Bittide clock; no
+  // MMCM), the same domain as the surrounding Clash logic.
+  val gmem_host_en   = IO(Input(Bool()))
+  val gmem_host_we   = IO(Input(UInt(4.W)))
+  val gmem_host_addr = IO(Input(UInt((gmemAddrBits - 1).W))) // 32-bit word address
+  val gmem_host_din  = IO(Input(UInt(32.W)))
+  val gmem_host_dout = IO(Output(UInt(32.W)))
 
   val clock_distribution = Module(new ClockDistributionNoMmcm)
   clock_distribution.io.root_clock := clk
@@ -109,14 +117,13 @@ class ManticoreBittideChip(
   gmem_bram.io.dinb  := gmem_adapter.io.din
   gmem_adapter.io.dout := gmem_bram.io.doutb
 
-  // host DMI on port A (same timing as the sim kernels' DMI / axislave_vip:
-  // read every cycle, registered once; halfword select held alongside)
+  // host raw BRAM port on port A: driven directly by the Clash ReqResp bridge
+  // (which registers address/data/dout on its side for timing). Read-first,
+  // 1-cycle read latency, byte write-enables.
   gmem_bram.io.clka  := control_clock
-  gmem_bram.io.ena   := true.B
-  gmem_bram.io.wea   := Mux(dmi_wen, Mux(dmi_addr(0), "b1100".U(4.W), "b0011".U(4.W)), 0.U(4.W))
-  gmem_bram.io.addra := dmi_addr(gmemAddrBits - 1, 1)
-  gmem_bram.io.dina  := chisel3.util.Cat(dmi_wdata, dmi_wdata)
-  dmi_rdata := withClockAndReset(control_clock, reset_w) {
-    Mux(RegNext(dmi_addr(0), false.B), gmem_bram.io.douta(31, 16), gmem_bram.io.douta(15, 0))
-  }
+  gmem_bram.io.ena   := gmem_host_en
+  gmem_bram.io.wea   := gmem_host_we
+  gmem_bram.io.addra := gmem_host_addr
+  gmem_bram.io.dina  := gmem_host_din
+  gmem_host_dout     := gmem_bram.io.douta
 }
