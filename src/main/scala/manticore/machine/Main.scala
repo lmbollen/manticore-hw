@@ -20,6 +20,11 @@ object Main {
       dimx: Int = 2,
       dimy: Int = 2,
       enable_custom_alu: Boolean = true,
+      // multi-chip bittide: this chip is a dimx x dimy sub-array of a
+      // torus_dimx x torus_dimy global torus (0 = single standalone chip, no seams).
+      torus_dimx: Int = 0,
+      torus_dimy: Int = 0,
+      stall_wave: Boolean = false,
       target: String = "<INV>",
       output: File = new File("."),
       platform: String = "",
@@ -92,6 +97,15 @@ object Main {
         opt[Int]("n_hop")
           .action { case (p, c) => c.copy(n_hop = p) }
           .text("number of hops between cores"),
+        opt[Int]("torus_dimx")
+          .action { case (v, c) => c.copy(torus_dimx = v) }
+          .text("global torus X dimension for a multi-chip bittide build (0 = single chip)"),
+        opt[Int]("torus_dimy")
+          .action { case (v, c) => c.copy(torus_dimy = v) }
+          .text("global torus Y dimension for a multi-chip bittide build (0 = single chip)"),
+        opt[Boolean]("stall_wave")
+          .action { case (b, c) => c.copy(stall_wave = b) }
+          .text("enable the distributed scheduled stall wave (multi-chip)"),
         opt[Unit]("list")
           .action { case (b, c) => c.copy(list_platforms = true) }
           .text("print a list of available platforms"),
@@ -262,7 +276,10 @@ object Main {
               DimY = cfg.dimy,
               enable_custom_alu = cfg.enable_custom_alu,
               debug_enable = false,
-              n_hop = cfg.n_hop
+              n_hop = cfg.n_hop,
+              torusDimX = cfg.torus_dimx,
+              torusDimY = cfg.torus_dimy,
+              stallWave = cfg.stall_wave
             ),
             Array(
               "--target-dir",

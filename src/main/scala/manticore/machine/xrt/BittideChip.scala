@@ -2,9 +2,13 @@ package manticore.machine.xrt
 
 import chisel3._
 import chisel3.util.HasBlackBoxResource
+import manticore.machine.ManticoreFullISA
 import manticore.machine.core.DeviceRegisters
 import manticore.machine.core.HostRegisters
 import manticore.machine.core.ManticoreFlatArray
+import manticore.machine.core.NoCBundle
+import manticore.machine.core.TdmFrame
+import manticore.machine.core.TdmTorusBoundaryBridge
 import manticore.machine.memory.GmemBramBackend
 import manticore.machine.memory.GmemHalfWordAdapter
 import manticore.machine.memory.TrueDualPortBram
@@ -49,8 +53,24 @@ class ManticoreBittideChip(
     enable_custom_alu: Boolean = true,
     debug_enable: Boolean = false,
     n_hop: Int = 1,
-    gmemAddrBits: Int = 16 // 64Ki halfwords = 128 KiB
+    gmemAddrBits: Int = 16, // 64Ki halfwords = 128 KiB
+    // Multi-chip seam: this chip is a DimX x DimY sub-array of a global
+    // torusDimX x torusDimY torus. 0 (default) = a single standalone chip (no
+    // seams), milestone-1 behaviour. When > 0 the chip boots only its own cores
+    // (per-chip boot), runs in stall-wave mode, and exposes one TDM seam per edge.
+    torusDimX: Int = 0,
+    torusDimY: Int = 0,
+    stallWave: Boolean = false,
+    // CONSTANT register-to-register seam latency (== the compiler's --hop-latencies
+    // value for these links); the external Bittide link supplies the wire latency,
+    // wireLatency = seamLatency - 2*nLinks*cyclesPerSlot - 2 (see TdmTorusBoundaryBridge).
+    seamLatency: Int = 25,
+    cyclesPerSlot: Int = 1
 ) extends RawModule {
+
+  private val multiChip = torusDimX > 0 || torusDimY > 0
+  private val tX        = if (torusDimX > 0) torusDimX else DimX
+  private val tY        = if (torusDimY > 0) torusDimY else DimY
 
   val clk = IO(Input(Clock()))
   val rst = IO(Input(Bool())) // active-high, Bittide domain
@@ -82,7 +102,17 @@ class ManticoreBittideChip(
   private val control_clock        = clock_distribution.io.control_clock
 
   val manticore = Module(
-    new ManticoreFlatArray(DimX, DimY, debug_enable, enable_custom_alu = enable_custom_alu, n_hop = n_hop)
+    new ManticoreFlatArray(
+      DimX,
+      DimY,
+      debug_enable,
+      enable_custom_alu = enable_custom_alu,
+      n_hop = n_hop,
+      torusDimX = torusDimX,
+      torusDimY = torusDimY,
+      perChipBoot = multiChip, // each chip boots only its own cores from its own gmem
+      stallWave = stallWave
+    )
   )
   manticore.io.reset         := reset_w
   manticore.io.control_clock := control_clock
@@ -126,4 +156,57 @@ class ManticoreBittideChip(
   gmem_bram.io.addra := gmem_host_addr
   gmem_bram.io.dina  := gmem_host_din
   gmem_host_dout     := gmem_bram.io.douta
+
+  // ---- multi-chip seams: one TDM bridge per edge, flat TdmFrame tx/rx pins ----
+  // Each edge serializes its nLinks boundary links onto one transceiver pair (a
+  // single Bittide link). The transceiver/wire is EXTERNAL (the Clash side carries
+  // `seam_<edge>_tx` -> link -> neighbour `seam_<edge>_rx`); only the bridge lives in
+  // the chip, on the gated compute clock (compute == Bittide between gates, and a
+  // stall lands on a vcycle boundary where the seam is empty). `seam_<edge>_extend`
+  // (set by the chip's grid position) selects whether the edge is wired to a
+  // neighbour; an unextended edge U-turns internally and its tx is idle. Per-chip
+  // boot puts no traffic on the seam, so no boot bypass is needed.
+  if (multiChip) {
+    val mc = manticore.mc.get
+
+    def mkSeam(
+        name: String,
+        nLinks: Int,
+        setExtend: Bool => Unit,
+        fwdOut: Vec[NoCBundle],
+        bwdOut: Vec[NoCBundle],
+        fwdIn: Vec[NoCBundle],
+        bwdIn: Vec[NoCBundle]
+    ): Unit = {
+      val proto   = new TdmFrame(tX, tY, ManticoreFullISA, 2 * nLinks, cyclesPerSlot)
+      val frameW  = proto.getWidth
+      val wireLat = seamLatency - 2 * nLinks * cyclesPerSlot - 2
+      require(wireLat >= 1, s"seamLatency $seamLatency too small for $name seam (nLinks=$nLinks)")
+
+      val extend = IO(Input(Bool())).suggestName(s"seam_${name}_extend")
+      val tx     = IO(Output(UInt(frameW.W))).suggestName(s"seam_${name}_tx")
+      val rx     = IO(Input(UInt(frameW.W))).suggestName(s"seam_${name}_rx")
+      val ovf    = IO(Output(Bool())).suggestName(s"seam_${name}_overflow")
+
+      setExtend(extend)
+
+      val bridge = withClockAndReset(clock_distribution.io.compute_clock, reset_w) {
+        Module(new TdmTorusBoundaryBridge(nLinks, cyclesPerSlot, wireLat, seamLatency, tX, tY, ManticoreFullISA))
+      }
+      bridge.io.fwdOut    := fwdOut
+      bridge.io.bwdOut    := bwdOut
+      fwdIn               := bridge.io.fwdIn
+      bwdIn               := bridge.io.bwdIn
+      bridge.io.connected := extend
+      bridge.io.bypass    := false.B
+      tx                  := bridge.io.tx.asUInt
+      bridge.io.rx        := rx.asTypeOf(proto)
+      ovf                 := bridge.io.demuxOverflow
+    }
+
+    mkSeam("east",  DimY, (b: Bool) => mc.east.extend  := b, mc.east.fwdOut,  mc.east.bwdOut,  mc.east.fwdIn,  mc.east.bwdIn)
+    mkSeam("west",  DimY, (b: Bool) => mc.west.extend  := b, mc.west.fwdOut,  mc.west.bwdOut,  mc.west.fwdIn,  mc.west.bwdIn)
+    mkSeam("north", DimX, (b: Bool) => mc.north.extend := b, mc.north.fwdOut, mc.north.bwdOut, mc.north.fwdIn, mc.north.bwdIn)
+    mkSeam("south", DimX, (b: Bool) => mc.south.extend := b, mc.south.fwdOut, mc.south.bwdOut, mc.south.fwdIn, mc.south.bwdIn)
+  }
 }
