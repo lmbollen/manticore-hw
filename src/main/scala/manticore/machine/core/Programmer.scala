@@ -37,12 +37,24 @@ class ProgrammerInterface(config: ISA, DimX: Int, DimY: Int) extends Bundle {
 
 }
 
-class Programmer(config: ISA, DimX: Int, DimY: Int) extends Module {
+/** `DimX`/`DimY` size the NoC packet hop fields (the global torus, so packets route
+  * across the whole system). `bootDimX`/`bootDimY` (default = DimX/DimY) size the boot
+  * GRID this Programmer is responsible for: how many cores it streams to and sends the
+  * start-countdown to. For per-chip boot in a multi-chip system, set them to the chip's
+  * PHYSICAL dims (e.g. 4x4) so each chip's bootloader programs only its own local cores
+  * (intra-chip, the small forward hops still route on the wider global hop field); the
+  * default keeps the whole-torus boot used by the single-master kernels.
+  */
+class Programmer(config: ISA, DimX: Int, DimY: Int, bootDimX: Int = -1, bootDimY: Int = -1) extends Module {
   require(
     config.DataBits == 16,
     "Only 16-bit data width is supported with the cache implementation"
   )
   val io: ProgrammerInterface = IO(new ProgrammerInterface(config, DimX, DimY))
+
+  // the boot grid (cores this Programmer is responsible for); defaults to the whole torus
+  private val bootX: Int = if (bootDimX > 0) bootDimX else DimX
+  private val bootY: Int = if (bootDimY > 0) bootDimY else DimY
 
   object Phase extends ChiselEnum {
     val Idle, StartCacheRead, StreamDest, StreamBodyLength, StreamInstruction, StreamEpilogueLength, StreamSleepLength,
@@ -88,8 +100,8 @@ class Programmer(config: ISA, DimX: Int, DimY: Int) extends Module {
     io.value := count_reg
   }
 
-  val x_counter = Module(new WrappingCounter(DimX))
-  val y_counter = Module(new WrappingCounter(DimY))
+  val x_counter = Module(new WrappingCounter(bootX))
+  val y_counter = Module(new WrappingCounter(bootY))
 
   x_counter.io.en := false.B
   y_counter.io.en := false.B
@@ -155,7 +167,7 @@ class Programmer(config: ISA, DimX: Int, DimY: Int) extends Module {
         // twe should fix the initial delay to a value such that
         // the last processors receives the delay value when the programmer
         // transitions to State.Running.
-        delay_value                 := (DimX * DimY - (DimX + DimY - 1)).U // magic formula
+        delay_value                 := (bootX * bootY - (bootX + bootY - 1)).U // magic formula
         instruction_stream_addr_reg := io.instruction_stream_base
 
       }
@@ -234,15 +246,16 @@ class Programmer(config: ISA, DimX: Int, DimY: Int) extends Module {
     }
     is(Phase.StreamCountDown) {
       xyCountUp()
-      // countdown hops are distances from (0,0), always non-negative → zero-extend to SInt
-      packet_out.xHops := ((DimX - 1).U - x_counter.io.value).zext
-      packet_out.yHops := ((DimY - 1).U - y_counter.io.value).zext
+      // countdown hops are distances from (0,0), always non-negative → zero-extend to SInt.
+      // Sized by the boot grid (the local chip), small enough to route on the wider field.
+      packet_out.xHops := ((bootX - 1).U - x_counter.io.value).zext
+      packet_out.yHops := ((bootY - 1).U - y_counter.io.value).zext
       packet_out.valid := true.B
       packet_out.data  := delay_value
 //      delay_value := delay_value - 1.U
 
       when(x_counter.io.wrap) {
-        delay_value := delay_value - (DimX - 1).U
+        delay_value := delay_value - (bootX - 1).U
       }
       when(x_counter.io.wrap && y_counter.io.wrap) {
         // streaming the last one

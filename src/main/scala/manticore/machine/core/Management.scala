@@ -15,9 +15,23 @@ object ManagementConstants {
   val CMD_CACHE_FLUSH   = 2.asUInt(7.W)
   val EXCEPTION_TIMEOUT = (1 << 16).asUInt(32.W)
 
+  // Reserved exception id for the distributed scheduled stall wave (stallWave mode):
+  // the privileged core's countdown heartbeat raises an interrupt with this eid when
+  // the countdown reaches zero, telling Management to gate the clock at that vcycle
+  // boundary. The compiler must NOT assign this eid to any application interrupt
+  // (success eids count up from 0, failure eids from 0x8000 — 0x7FFF is reserved).
+  val STALL_EID = 0x7FFF.asUInt(32.W)
+
+  // schedule_config bit that ARMS the stall wave for a run. The stall wave is a
+  // main-compute-phase concept; boot/initializer phases (init_0/init_1) carry no STALL
+  // heartbeat and must keep immediate gate-on-exception, so the host arms this bit only
+  // for the main START. It lives in the CMD-DATA field just below the 7-bit command, well
+  // above any practical timeout value (timeout uses bits 54:0).
+  val STALL_ARM_BIT = 55
+
 }
 
-class Management(dimX: Int, dimY: Int) extends Module {
+class Management(dimX: Int, dimY: Int, stallWave: Boolean = false) extends Module {
 
   import ManagementConstants._
   val io = IO(new Bundle {
@@ -67,6 +81,30 @@ class Management(dimX: Int, dimY: Int) extends Module {
 
   val core_exception_id = Reg(io.exception_id.cloneType)
 
+  // Distributed resume (multi-IC): the host schedules every IC to ungate at the same
+  // free-running cycle R. totalCycleCount keeps ticking while the compute clock is gated
+  // (it is incremented unconditionally on the always-on control clock) and is aligned
+  // across ICs released from reset together, so a common R lands on the same global
+  // cycle everywhere. CMD_RESUME with timeout_enabled set carries R in the timeout field;
+  // Management holds the clock gated in sResumeWait until totalCycleCount === R.
+  val resume_target = Reg(UInt(40.W))
+
+  // Distributed scheduled stall wave: when ARMED (a stallWave-enabled build AND the host
+  // set STALL_ARM_BIT for this run — only the main compute phase) the clock gates only on
+  // the reserved STALL interrupt (raised by the privileged core's countdown heartbeat when
+  // it reaches zero), NOT on application exceptions ($display/FINISH) — those merely seed
+  // the countdown and keep running (deferred-precise). When NOT armed — i.e. a legacy build,
+  // or the boot/initializer phases of a stallWave build — the gate fires immediately on any
+  // exception (the legacy behaviour). The `if (stallWave)` keeps non-stallWave builds
+  // bit-identical (no STALL compare / mux synthesized at all).
+  val is_stall_exception = io.core_exception_occurred && (io.exception_id === STALL_EID)
+  val stall_armed        = if (stallWave) io.schedule_config(STALL_ARM_BIT).asBool else false.B
+  val gate_trigger       = if (stallWave) Mux(stall_armed, is_stall_exception, io.core_exception_occurred)
+                           else io.core_exception_occurred
+  // capture the application eid (so the host sees the FLUSH/FINISH, not STALL)
+  val capture_eid        = if (stallWave) Mux(stall_armed, io.core_exception_occurred && !is_stall_exception, true.B)
+                           else true.B
+
   /* performance counters */
   val vcycleCount     = PerfCounter(40, 1) // 40-bit counter, i.e., count up to 256 trillion cycles
   val totalCycleCount = PerfCounter(40, 1) // 40-bit counter
@@ -86,11 +124,16 @@ class Management(dimX: Int, dimY: Int) extends Module {
   // -----------------+--------------------------------
   val command         = WireDefault(io.schedule_config.head(8).tail(1))        // the first 7 bit are the run command
   val timeout_enabled = WireDefault(io.schedule_config.head(8).head(1).asBool) // 8th bit, used to enable timeout
-  val timeout         = WireDefault(io.schedule_config.tail(8))                // timeout value
+  // bit 55 (STALL_ARM_BIT) is the stall-wave arm flag; timeout uses bits 54:0 (always
+  // 0 at bit 55 for real timeouts, so this is numerically unchanged for legacy callers).
+  val timeout         = WireDefault(io.schedule_config(54, 0))                 // timeout value
+  // scheduled-resume request: CMD_RESUME + timeout_enabled -> ungate at cycle R (the
+  // timeout field). Only in stallWave builds; legacy CMD_RESUME stays an immediate ungate.
+  val resume_at = if (stallWave) WireDefault((command === CMD_RESUME) && timeout_enabled) else WireDefault(false.B)
 
   object State extends ChiselEnum {
-    val sIdle, sCoreReset, sCoreResetWait, sCacheReset, sCacheResetWait, sBoot, sVirtualCycle, sCacheFlush,
-        sCacheFlushWait, sDone = Value
+    val sIdle, sCoreReset, sCoreResetWait, sCacheReset, sCacheResetWait, sBoot, sVirtualCycle, sResumeWait,
+        sCacheFlush, sCacheFlushWait, sDone = Value
   }
   import State._
 
@@ -139,12 +182,18 @@ class Management(dimX: Int, dimY: Int) extends Module {
 
     is(sIdle) {
       when(start_pulse && io.clock_locked) {
-        state := Mux(command === CMD_START, sCoreReset, Mux(command === CMD_RESUME, sVirtualCycle, sCacheFlush))
-        clock_active := Mux(
-          command === CMD_RESUME,
-          true.B,
-          false.B
-        ) // only enable the clock if we are resuming execution
+        // CMD_RESUME normally ungates immediately; a scheduled resume (resume_at) instead
+        // holds the clock gated in sResumeWait until the globally-agreed cycle R.
+        val resume_now = (command === CMD_RESUME) && !resume_at
+        state := Mux(
+          command === CMD_START,
+          sCoreReset,
+          Mux(command === CMD_RESUME, Mux(resume_at, sResumeWait, sVirtualCycle), sCacheFlush)
+        )
+        clock_active := resume_now // on only for an immediate resume; gated otherwise
+        when(resume_at) {
+          resume_target := timeout(39, 0)
+        }
         when(command === CMD_START) {
 
           totalCycleCount.clear()
@@ -196,6 +245,27 @@ class Management(dimX: Int, dimY: Int) extends Module {
       }
     }
 
+    is(sResumeWait) {
+      // Scheduled distributed resume: hold the compute clock gated until the globally
+      // agreed cycle R, then ungate into execution. Every IC's totalCycleCount is aligned
+      // (all released from reset together, counter never gates), so when every IC is armed
+      // BEFORE R, a common R makes all ICs leave the stall on the same free-running cycle.
+      //
+      // The host arms each IC individually and that may be sequential / variable-latency,
+      // so an IC can be armed AFTER its counter already passed R. We compare with `>=`
+      // (not `===`): an on-time IC still ungates exactly at R, but a late-armed IC ungates
+      // immediately instead of dead-locking until the 40-bit counter wraps. Choosing R far
+      // enough ahead that every IC is armed in time (so the resume stays synchronized) is a
+      // frontend/driver concern. Gated by stallWave so legacy builds synthesize none of this.
+      if (stallWave) {
+        clock_active := false.B
+        when(totalCycleCount.value >= resume_target) {
+          clock_active := true.B
+          state        := sVirtualCycle
+        }
+      }
+    }
+
     is(sVirtualCycle) {
 
       // The gmem clock-kill is gone (global memory is a fixed-latency on-chip
@@ -203,12 +273,14 @@ class Management(dimX: Int, dimY: Int) extends Module {
       // on an exception, and stays gated until the host resumes via
       // CMD_RESUME in sIdle.
       when(clock_active) {
-        clock_active := !io.core_exception_occurred
+        clock_active := !gate_trigger
       }
-      core_exception_id := io.exception_id
+      when(capture_eid) {
+        core_exception_id := io.exception_id
+      }
       when(clock_active) {
         // check exceptions for stopping execution
-        when(io.core_exception_occurred) {
+        when(gate_trigger) {
           // Precise-exception drain guard: a $display/FLUSH is trace GSTs followed by
           // the interrupt, with no drain NOPs — the last store's data may still be in
           // MemoryIntercept's control-clock FSM. Leaving sVirtualCycle right away

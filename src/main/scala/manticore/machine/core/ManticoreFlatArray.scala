@@ -323,7 +323,15 @@ class ManticoreFlatArray(
     // hop fields/Programmer span the global torus; the X seam links are exposed via
     // the optional `xb` IO so the harness/system can attach TDM bridges + transceivers.
     torusDimX: Int = 0,
-    torusDimY: Int = 0
+    torusDimY: Int = 0,
+    // Per-chip boot: when true this chip's Programmer boots ONLY its local dimx x dimy
+    // cores (each IC programs its own PEs from its own gmem), instead of the whole
+    // torus. False (default) = the single-master whole-torus boot (boot-over-seam).
+    perChipBoot: Boolean = false,
+    // Distributed scheduled stall wave: when true, Management gates the clock only on the
+    // reserved STALL interrupt (countdown heartbeat reaching zero), not immediately on
+    // application exceptions. False (default) = legacy immediate gate-on-exception.
+    stallWave: Boolean = false
 ) extends RawModule {
 
   val tX = if (torusDimX > 0) torusDimX else dimx
@@ -357,7 +365,7 @@ class ManticoreFlatArray(
     reset = io.reset,
     clock = io.control_clock
   ) {
-    Module(new Management(dimx, dimy))
+    Module(new Management(dimx, dimy, stallWave = stallWave))
   }
 
   val memory_intercept = withClockAndReset(
@@ -374,9 +382,11 @@ class ManticoreFlatArray(
     reset = controller.io.soft_reset
   ) {
     Module(
-      // the Programmer addresses the GLOBAL torus (its boot stream covers every core
-      // of the composed system; the countdown sweep spans all tX x tY positions)
-      new Programmer(ManticoreFullISA, tX, tY)
+      // the Programmer's PACKETS address the GLOBAL torus (tX x tY hop fields). Its boot
+      // GRID is either the whole torus (single-master boot-over-seam, default) or just
+      // this chip's local dimx x dimy cores (per-chip boot — each IC programs its own).
+      if (perChipBoot) new Programmer(ManticoreFullISA, tX, tY, bootDimX = dimx, bootDimY = dimy)
+      else new Programmer(ManticoreFullISA, tX, tY)
     )
   }
   controller.io.start         := io.start

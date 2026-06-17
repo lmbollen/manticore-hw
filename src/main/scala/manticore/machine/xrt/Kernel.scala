@@ -129,7 +129,11 @@ class ManticoreFlatSimKernel(
     DimY: Int,
     debug_enable: Boolean = false,
     enable_custom_alu: Boolean = true,
-    prefix_path: String = "."
+    prefix_path: String = ".",
+    // Distributed scheduled stall wave: gate the compute clock only on the reserved
+    // STALL interrupt (countdown heartbeat) instead of immediately on any exception.
+    // False (default) = legacy gate-on-exception, so existing tests are unchanged.
+    stallWave: Boolean = false
 ) extends Module {
 
   clock.suggestName("ap_clk")
@@ -170,7 +174,7 @@ class ManticoreFlatSimKernel(
   clock_distribution.io.root_clock := clock
 
   val manticore =
-    Module(new ManticoreFlatArray(DimX, DimY, debug_enable, enable_custom_alu, prefix_path))
+    Module(new ManticoreFlatArray(DimX, DimY, debug_enable, enable_custom_alu, prefix_path, stallWave = stallWave))
 
   manticore.io.reset         := reset
   manticore.io.control_clock := clock_distribution.io.control_clock
