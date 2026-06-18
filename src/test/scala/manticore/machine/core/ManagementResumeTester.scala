@@ -19,7 +19,8 @@ import org.scalatest.matchers.should.Matchers
   */
 class ManagementResumeTester extends AnyFlatSpec with ChiselScalatestTester with Matchers {
 
-  val CMD_RESUME = 1
+  val CMD_RESUME    = 1
+  val CMD_START_AT  = 3
 
   // schedule_config: bit63 = timeout_enabled, bits62:56 = command, bits54:0 = data (R)
   def resumeAtWord(r: Long): BigInt =
@@ -27,6 +28,10 @@ class ManagementResumeTester extends AnyFlatSpec with ChiselScalatestTester with
 
   // immediate resume: command = CMD_RESUME, timeout_enabled (bit63) clear
   def resumeNowWord: BigInt = BigInt(CMD_RESUME) << 56
+
+  // scheduled start: command = CMD_START_AT, S in the data field (no timeout_enabled —
+  // CMD_START_AT is itself the scheduled variant; the timeout field carries S).
+  def startAtWord(s: Long): BigInt = (BigInt(CMD_START_AT) << 56) | BigInt(s)
 
   private def tieOff(dut: Management): Unit = {
     dut.io.start.poke(false.B)
@@ -117,6 +122,58 @@ class ManagementResumeTester extends AnyFlatSpec with ChiselScalatestTester with
       }
       assert(active, s"clock never ungated for a past R=$rPast (t0=$t0) — deadlock")
       info(s"late-arm: t0=$t0, R(past)=$rPast, ungated within ${guard} cycles")
+      dut.io.idle.expect(false.B)
+    }
+  }
+
+  it should "boot then hold the clock gated until the scheduled START cycle S (CMD_START_AT)" in {
+    // Cycle-accurate simultaneous start: CMD_START_AT boots like CMD_START but, instead of
+    // executing immediately at boot-finish (which is data-dependent latency), holds the
+    // booted compute clock gated in sResumeWait until the globally-agreed cycle S. So all
+    // ICs begin their first vcycle on the same free-running cycle despite boot skew. The
+    // reset-aligned totalCycleCount is NOT re-zeroed, so S stays in the shared domain.
+    test(new Management(dimX = 2, dimY = 2, stallWave = true)) { dut =>
+      dut.clock.setTimeout(0)
+      tieOff(dut)
+      dut.reset.poke(true.B)
+      dut.clock.step(4)
+      dut.reset.poke(false.B)
+      dut.clock.step(8)
+
+      val t0 = dut.io.device_registers.execution_cycles.peek().litValue.toLong
+      val s  = t0 + 150L // far enough ahead to cover the boot sequence
+
+      // drive boot to completion (cache_done + boot_finished asserted) so the FSM walks
+      // sCoreReset..sBoot, then must wait in sResumeWait until S.
+      dut.io.cache_done.poke(true.B)
+      dut.io.boot_finished.poke(true.B)
+      dut.io.schedule_config.poke(startAtWord(s).U)
+      dut.io.start.poke(true.B)
+      dut.clock.step()
+      dut.io.start.poke(false.B)
+
+      // advance past boot (~35 cycles for 2x2) into the scheduled-ungate wait
+      dut.clock.step(60)
+      val cycAfterBoot = dut.io.device_registers.execution_cycles.peek().litValue.toLong
+      assert(cycAfterBoot < s, s"boot took longer than expected (cyc=$cycAfterBoot >= S=$s); raise S")
+      // booted but gated, waiting for S — NOT idle, NOT yet executing
+      dut.io.clock_active.expect(false.B)
+      dut.io.idle.expect(false.B)
+
+      // step until ungate; assert it lands at ~S, not at boot-finish
+      var ungatedCycle = -1L
+      var guard        = 0
+      while (ungatedCycle < 0 && guard < 500) {
+        if (dut.io.clock_active.peekBoolean()) {
+          ungatedCycle = dut.io.device_registers.execution_cycles.peek().litValue.toLong
+        } else {
+          dut.clock.step(); guard += 1
+        }
+      }
+      assert(ungatedCycle >= 0, s"clock never ungated within guard window (S=$s)")
+      info(s"scheduled start: armed at t0=$t0, booted by $cycAfterBoot, S=$s, ungated at $ungatedCycle")
+      assert(ungatedCycle >= s && ungatedCycle <= s + 3,
+        s"ungated at $ungatedCycle, expected ~S=$s (a scheduled start must wait for S, not start at boot-finish)")
       dut.io.idle.expect(false.B)
     }
   }

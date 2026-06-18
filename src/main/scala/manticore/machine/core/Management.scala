@@ -13,6 +13,13 @@ object ManagementConstants {
   val CMD_START         = 0.asUInt(7.W)
   val CMD_RESUME        = 1.asUInt(7.W)
   val CMD_CACHE_FLUSH   = 2.asUInt(7.W)
+  // Scheduled START (multi-IC, stallWave builds): boot like CMD_START, but instead of
+  // executing immediately, hold the compute clock gated until the agreed free-running
+  // cycle S (carried in the timeout field, bits 39:0), then ungate. Lets every IC begin
+  // its first vcycle on a common cycle despite per-IC boot-latency skew — the START
+  // analogue of resume-at-R. The reset-aligned totalCycleCount is NOT re-zeroed (unlike
+  // immediate CMD_START), so S is in the shared domain.
+  val CMD_START_AT      = 3.asUInt(7.W)
   val EXCEPTION_TIMEOUT = (1 << 16).asUInt(32.W)
 
   // Reserved exception id for the distributed scheduled stall wave (stallWave mode):
@@ -81,13 +88,15 @@ class Management(dimX: Int, dimY: Int, stallWave: Boolean = false) extends Modul
 
   val core_exception_id = Reg(io.exception_id.cloneType)
 
-  // Distributed resume (multi-IC): the host schedules every IC to ungate at the same
-  // free-running cycle R. totalCycleCount keeps ticking while the compute clock is gated
-  // (it is incremented unconditionally on the always-on control clock) and is aligned
-  // across ICs released from reset together, so a common R lands on the same global
-  // cycle everywhere. CMD_RESUME with timeout_enabled set carries R in the timeout field;
-  // Management holds the clock gated in sResumeWait until totalCycleCount === R.
-  val resume_target = Reg(UInt(40.W))
+  // Distributed scheduled ungate (multi-IC): the host schedules every IC to ungate its
+  // compute clock at the same free-running cycle. Used for BOTH a scheduled START
+  // (CMD_START_AT, after boot) and a scheduled RESUME (CMD_RESUME + timeout_enabled, after
+  // a stall). totalCycleCount keeps ticking while the compute clock is gated (incremented
+  // unconditionally on the always-on control clock) and is aligned across ICs released
+  // from reset together, so a common target lands on the same global cycle everywhere. The
+  // target cycle rides the timeout field; Management holds the clock gated in sResumeWait
+  // until totalCycleCount >= ungate_target.
+  val ungate_target = Reg(UInt(40.W))
 
   // Distributed scheduled stall wave: when ARMED (a stallWave-enabled build AND the host
   // set STALL_ARM_BIT for this run — only the main compute phase) the clock gates only on
@@ -130,6 +139,13 @@ class Management(dimX: Int, dimY: Int, stallWave: Boolean = false) extends Modul
   // scheduled-resume request: CMD_RESUME + timeout_enabled -> ungate at cycle R (the
   // timeout field). Only in stallWave builds; legacy CMD_RESUME stays an immediate ungate.
   val resume_at = if (stallWave) WireDefault((command === CMD_RESUME) && timeout_enabled) else WireDefault(false.B)
+  // scheduled-start request: CMD_START_AT -> boot, then ungate at cycle S (the timeout
+  // field), mirroring resume-at-R so all ICs begin their first executing vcycle on a
+  // common free-running cycle despite per-IC boot-latency skew.
+  val start_at = if (stallWave) WireDefault(command === CMD_START_AT) else WireDefault(false.B)
+  // remembers (through the boot states) that this run is a scheduled start, so sBoot routes
+  // to the ungate-wait (sResumeWait) instead of straight to sVirtualCycle.
+  val start_pending = RegInit(false.B)
 
   object State extends ChiselEnum {
     val sIdle, sCoreReset, sCoreResetWait, sCacheReset, sCacheResetWait, sBoot, sVirtualCycle, sResumeWait,
@@ -183,24 +199,33 @@ class Management(dimX: Int, dimY: Int, stallWave: Boolean = false) extends Modul
     is(sIdle) {
       when(start_pulse && io.clock_locked) {
         // CMD_RESUME normally ungates immediately; a scheduled resume (resume_at) instead
-        // holds the clock gated in sResumeWait until the globally-agreed cycle R.
+        // holds the clock gated in sResumeWait until the globally-agreed cycle R. CMD_START
+        // and the scheduled CMD_START_AT both boot (sCoreReset); the scheduled variant then
+        // waits in sResumeWait at the end of boot (see sBoot/start_pending).
         val resume_now = (command === CMD_RESUME) && !resume_at
+        val do_boot    = (command === CMD_START) || start_at
         state := Mux(
-          command === CMD_START,
+          do_boot,
           sCoreReset,
           Mux(command === CMD_RESUME, Mux(resume_at, sResumeWait, sVirtualCycle), sCacheFlush)
         )
         clock_active := resume_now // on only for an immediate resume; gated otherwise
-        when(resume_at) {
-          resume_target := timeout(39, 0)
+        when(resume_at || start_at) {
+          ungate_target := timeout(39, 0)
         }
-        when(command === CMD_START) {
-
-          totalCycleCount.clear()
+        if (stallWave) {
+          when(start_at) { start_pending := true.B }
+        }
+        when(do_boot) {
+          // A scheduled start (start_at) must keep the reset-aligned totalCycleCount so its
+          // target S lands on the same global cycle as the other ICs; only an immediate
+          // (single-chip) CMD_START re-zeros the time base.
+          when(!start_at) {
+            totalCycleCount.clear()
+          }
           vcycleCount.clear()
           bootCycleCount.clear()
           clockStallCount.clear()
-
         }
         soft_reset_countdown_timer := soft_reset_value.U
       }
@@ -241,13 +266,22 @@ class Management(dimX: Int, dimY: Int, stallWave: Boolean = false) extends Modul
       // dev_regs.bootloader_cycles := dev_regs.bootloader_cycles + 1.U
       clock_active := true.B // enable the clock so that NoC can be used
       when(io.boot_finished) {
-        state := sVirtualCycle
+        // A scheduled start (CMD_START_AT) holds the now-booted compute clock gated in
+        // sResumeWait until the agreed cycle S, so every IC begins its first vcycle
+        // together despite boot-latency skew; an immediate start executes right away.
+        if (stallWave) {
+          state         := Mux(start_pending, sResumeWait, sVirtualCycle)
+          start_pending := false.B
+        } else {
+          state := sVirtualCycle
+        }
       }
     }
 
     is(sResumeWait) {
-      // Scheduled distributed resume: hold the compute clock gated until the globally
-      // agreed cycle R, then ungate into execution. Every IC's totalCycleCount is aligned
+      // Scheduled distributed ungate (shared by CMD_START_AT after boot and CMD_RESUME after
+      // a stall): hold the compute clock gated until the globally
+      // agreed cycle (ungate_target), then ungate into execution. Every IC's totalCycleCount is aligned
       // (all released from reset together, counter never gates), so when every IC is armed
       // BEFORE R, a common R makes all ICs leave the stall on the same free-running cycle.
       //
@@ -259,7 +293,7 @@ class Management(dimX: Int, dimY: Int, stallWave: Boolean = false) extends Modul
       // frontend/driver concern. Gated by stallWave so legacy builds synthesize none of this.
       if (stallWave) {
         clock_active := false.B
-        when(totalCycleCount.value >= resume_target) {
+        when(totalCycleCount.value >= ungate_target) {
           clock_active := true.B
           state        := sVirtualCycle
         }
