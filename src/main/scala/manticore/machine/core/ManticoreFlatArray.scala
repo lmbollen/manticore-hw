@@ -191,10 +191,19 @@ class ComputeArray(
   val westBoundary  = Module(new TorusBoundary(dimy, tX, tY, ManticoreFullISA))
   val northBoundary = Module(new TorusBoundary(dimx, tX, tY, ManticoreFullISA))
   val southBoundary = Module(new TorusBoundary(dimx, tX, tY, ManticoreFullISA))
-  eastBoundary.io.extend  := io.extendEast
-  westBoundary.io.extend  := io.extendWest
-  northBoundary.io.extend := io.extendNorth
-  southBoundary.io.extend := io.extendSouth
+  // Open a seam to the neighbour chip ONLY after this chip's boot window. During
+  // config (boot stream) a bootloader packet whose intra-chip route reaches a
+  // boundary must U-turn locally; with extend high it would leak onto the seam and
+  // corrupt a neighbour chip's (skewed) boot. config_enable is exactly the boot
+  // window. Single-chip (standalone torus) ties all four extend inputs to false,
+  // so the AND is a no-op there (byte-identical). On the multi-FPGA rig the
+  // driver-controlled seam_*_extend pin flows here too, so this gates the rig boot
+  // as well (the pin alone has no boot gating).
+  val seamOpen = !io.config_enable
+  eastBoundary.io.extend  := io.extendEast  && seamOpen
+  westBoundary.io.extend  := io.extendWest  && seamOpen
+  northBoundary.io.extend := io.extendNorth && seamOpen
+  southBoundary.io.extend := io.extendSouth && seamOpen
 
   Range(0, dimy).foreach { y =>
     // middle cut: out-chain end (col h-1) <-> back-chain start (col h)
