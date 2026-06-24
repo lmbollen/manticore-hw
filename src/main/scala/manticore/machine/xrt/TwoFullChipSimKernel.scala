@@ -43,8 +43,8 @@ class TwoFullChipSimKernel(
     // seam timing (defaults match data/latencies.csv: T = 25, period = 8)
     cyclesPerSlot: Int = 1,
     seamLatency: Int = 25,      // T: constant register-to-register seam latency
-    execWireLatency: Int = 15,  // steady-state transceiver pipe depth (= T - period - 2)
-    bypassWireLatency: Int = 22 // boot transceiver pipe depth (= T - 3)
+    execWireLatency: Int = 14,  // steady-state transceiver pipe depth (= T - period - 3)
+    bypassWireLatency: Int = 21 // boot transceiver pipe depth (= T - 4)
 ) extends Module {
 
   clock.suggestName("ap_clk")

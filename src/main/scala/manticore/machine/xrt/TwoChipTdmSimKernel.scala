@@ -38,18 +38,19 @@ import manticore.machine.memory.SimGmem
   * latencies.csv). The compiler's boot-skew padding compensates the countdown
   * skew these slow seams introduce.
   *
-  * Latency budget — the steady-state wire must be EXACTLY `T - period - 2`:
+  * Latency budget — the steady-state wire must be EXACTLY `T - period - 3` (the -3,
+  * vs the earlier -2, includes the demux io.out pipeline register):
   *   - steady state : a frame waits up to `period-1` for its slot, crosses the
   *     wire, and the demux holds it so the total is `T`. The demux hold for an
-  *     age-a packet is `T - 2 - wire - a` cycles of bank occupancy; with
-  *     wire = T - period - 2 that is `period - a <= period`, so a same-link
+  *     age-a packet is `T - 3 - wire - a` cycles of bank occupancy; with
+  *     wire = T - period - 3 that is `period - a <= period`, so a same-link
   *     crossing one full TDM period later (the compiler's minimum spacing under
   *     --tdm-period) lands exactly on the release boundary and never collides.
   *     A SHALLOWER wire shifts that cycle into the demux hold and makes the
   *     occupancy exceed the period — back-to-back period-spaced crossings then
   *     overwrite the bank 1 cycle before release (release==1 overflows).
   *   - boot bypass  : banks drain immediately (full rate), so we pad the bypass
-  *     wire to `bypassWireLatency = T - 3` to keep the crossing at `T` as well —
+  *     wire to `bypassWireLatency = T - 4` to keep the crossing at `T` as well —
   *     one constant the compiler can model.
   */
 class TwoChipTdmSimKernel(
@@ -60,8 +61,8 @@ class TwoChipTdmSimKernel(
     // seam timing (defaults match data/latencies.csv: T = 25, period = 8)
     cyclesPerSlot: Int = 1,
     seamLatency: Int = 25,       // T: constant register-to-register seam latency
-    execWireLatency: Int = 15,   // steady-state transceiver pipe depth (= T - period - 2)
-    bypassWireLatency: Int = 22  // boot transceiver pipe depth (= T - 3)
+    execWireLatency: Int = 14,   // steady-state transceiver pipe depth (= T - period - 3)
+    bypassWireLatency: Int = 21  // boot transceiver pipe depth (= T - 4)
 ) extends Module {
 
   clock.suggestName("ap_clk")

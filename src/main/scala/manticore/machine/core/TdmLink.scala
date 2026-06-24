@@ -145,14 +145,18 @@ class TdmLinkDemux(
   //   frame at this demux during s + wireLatency
   //   output bank holds it from  s + wireLatency + 1
   //   presented (1-cycle pulse) at p = s + wireLatency + 1 + release
-  //   destination switch register occupied at p + 1
-  // Constant-latency contract: (p + 1) - t == totalLatency for EVERY packet, i.e.
-  //   release = totalLatency - 3 - wireLatency - age   (>= 0 must hold at age = period-1)
+  //   io.out PIPELINE register drives the boundary switch at p + 1
+  //   destination switch register occupied at p + 2
+  // The io.out register breaks the route-dominated seam -> boundary-switch combinational
+  // hop (it was the timing-critical path: ~12.6ns, 92% routing), at the cost of one extra
+  // crossing cycle (absorbed by shortening the wire pipe by 1 -- see the +3 contract).
+  // Constant-latency contract: (p + 2) - t == totalLatency for EVERY packet, i.e.
+  //   release = totalLatency - 4 - wireLatency - age   (>= 0 must hold at age = period-1)
   private val period = nBanks * cyclesPerSlot
   require(
-    totalLatency >= period + wireLatency + 2,
-    s"totalLatency $totalLatency must cover the worst TDM path ${period + wireLatency + 2} " +
-      s"(capture + slot wait ${period - 1} + wire $wireLatency + bank + switch)"
+    totalLatency >= period + wireLatency + 3,
+    s"totalLatency $totalLatency must cover the worst TDM path ${period + wireLatency + 3} " +
+      s"(capture + slot wait ${period - 1} + wire $wireLatency + bank + out-reg + switch)"
   )
   val io = IO(new Bundle {
     val rx        = Input(new TdmFrame(DimX, DimY, config, nBanks, cyclesPerSlot))
@@ -166,17 +170,22 @@ class TdmLinkDemux(
   val bankValid = RegInit(VecInit(Seq.fill(nBanks)(false.B)))
   val release   = Reg(Vec(nBanks, UInt(log2Ceil(totalLatency + 2).W)))
 
+  // Compute the 1-cycle presentation pulse combinationally, then REGISTER it onto io.out.
+  // io.out feeds the boundary NoC switch, and that hop was the route-dominated critical
+  // path; the register splits it (and adds the +1 crossing cycle accounted for above).
+  val present = Wire(Vec(nBanks, new NoCBundle(DimX, DimY, config)))
   for (i <- 0 until nBanks) {
-    io.out(i) := NoCBundle.empty(DimX, DimY, config) // default: 1-cycle pulse semantics
+    present(i) := NoCBundle.empty(DimX, DimY, config) // default: 1-cycle pulse semantics
     when(bankValid(i)) {
       when(release(i) === 0.U) {
-        io.out(i)    := outBanks(i)
+        present(i)   := outBanks(i)
         bankValid(i) := false.B
       } otherwise {
         release(i) := release(i) - 1.U
       }
     }
   }
+  io.out := RegNext(present, VecInit(Seq.fill(nBanks)(NoCBundle.empty(DimX, DimY, config))))
 
   val overflowNow = WireDefault(false.B)
   when(io.rx.valid && io.connected) {
@@ -187,7 +196,7 @@ class TdmLinkDemux(
     bankValid(io.rx.tag) := true.B
     // bypass: present next cycle (full rate); the harness pads the bypass wire so the
     // total crossing latency still equals totalLatency exactly
-    release(io.rx.tag)   := Mux(io.bypass, 0.U, (totalLatency - 3 - wireLatency).U - io.rx.age)
+    release(io.rx.tag)   := Mux(io.bypass, 0.U, (totalLatency - 4 - wireLatency).U - io.rx.age)
   }
   io.overflow := overflowNow
 }
@@ -208,15 +217,16 @@ class TdmTorusBoundaryBridge(
     config: ISA
 ) extends Module {
   val nBanks = 2 * nLinks
-  // The wire must absorb ALL the slack: with wireLatency == totalLatency - period - 2
+  // The wire must absorb ALL the slack: with wireLatency == totalLatency - period - 3
   // the demux bank occupancy of an age-a packet is period - a <= period, so a same-link
   // crossing one TDM period later (the compiler's minimum spacing under --tdm-period)
   // never overwrites an unreleased bank. A shallower wire moves slack into the demux
-  // hold and period-spaced crossings collide 1 cycle before release.
+  // hold and period-spaced crossings collide 1 cycle before release. (The +3, vs the
+  // earlier +2, is the io.out pipeline register added in TdmLinkDemux.)
   require(
-    totalLatency == 2 * nLinks * cyclesPerSlot + wireLatency + 2,
-    s"totalLatency $totalLatency must equal period ${2 * nLinks * cyclesPerSlot} + wireLatency $wireLatency + 2 " +
-      "(full-rate same-link reuse at one packet per TDM period)"
+    totalLatency == 2 * nLinks * cyclesPerSlot + wireLatency + 3,
+    s"totalLatency $totalLatency must equal period ${2 * nLinks * cyclesPerSlot} + wireLatency $wireLatency + 3 " +
+      "(full-rate same-link reuse at one packet per TDM period; +1 for the io.out pipeline register)"
   )
   val io = IO(new Bundle {
     // array-facing (connect to BareNoC's xFwdOut/xBwdOut and xFwdIn/xBwdIn)

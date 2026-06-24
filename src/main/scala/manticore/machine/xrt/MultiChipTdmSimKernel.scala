@@ -59,8 +59,8 @@ class MultiChipTdmSimKernel(
   val gDimY = chipRows * chipDimY
   require(chipCols >= 1 && chipRows >= 1 && chipCols * chipRows >= 2)
 
-  def execWire(nLinks: Int)   = seamLatency - 2 * nLinks * cyclesPerSlot - 2 // EXACT, see TdmLinkDemux
-  val bypassWireLatency       = seamLatency - 3
+  def execWire(nLinks: Int)   = seamLatency - 2 * nLinks * cyclesPerSlot - 3 // EXACT, see TdmLinkDemux (+1 io.out reg)
+  val bypassWireLatency       = seamLatency - 4
   require(execWire(chipDimX) >= 1 && execWire(chipDimY) >= 1, s"seamLatency $seamLatency too small")
 
   class KernelRegisters extends Bundle {

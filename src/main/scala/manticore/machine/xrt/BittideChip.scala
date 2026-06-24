@@ -63,8 +63,13 @@ class ManticoreBittideChip(
     stallWave: Boolean = false,
     // CONSTANT register-to-register seam latency (== the compiler's --hop-latencies
     // value for these links); the external Bittide link supplies the wire latency,
-    // wireLatency = seamLatency - 2*nLinks*cyclesPerSlot - 2 (see TdmTorusBoundaryBridge).
-    seamLatency: Int = 25,
+    // wireLatency = seamLatency - 2*nLinks*cyclesPerSlot - 3 (see TdmTorusBoundaryBridge;
+    // -3 includes the demux io.out pipeline register). Bumped 25 -> 26: on the rig the
+    // transceiver wire is fixed (groomed to goldenUgn+margin), so the io.out register adds
+    // a genuine +1 to the seam crossing; the wireLat formula then recovers the SAME groomed
+    // wire as before. Sim kernels keep their own seamLatency (their wire pipe absorbs the
+    // register, so their crossing is unchanged). Compiler --hop-latencies +1 in Latencies.hs.
+    seamLatency: Int = 26,
     cyclesPerSlot: Int = 1
 ) extends RawModule {
 
@@ -180,7 +185,7 @@ class ManticoreBittideChip(
     ): Unit = {
       val proto   = new TdmFrame(tX, tY, ManticoreFullISA, 2 * nLinks, cyclesPerSlot)
       val frameW  = proto.getWidth
-      val wireLat = seamLatency - 2 * nLinks * cyclesPerSlot - 2
+      val wireLat = seamLatency - 2 * nLinks * cyclesPerSlot - 3 // -3 (was -2): +1 for the demux io.out pipeline register
       require(wireLat >= 1, s"seamLatency $seamLatency too small for $name seam (nLinks=$nLinks)")
 
       val extend = IO(Input(Bool())).suggestName(s"seam_${name}_extend")

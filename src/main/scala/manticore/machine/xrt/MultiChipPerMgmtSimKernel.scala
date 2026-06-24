@@ -209,8 +209,10 @@ class MultiChipPerMgmtSimKernel(
   // matching depth — so the two directions can have independent (asymmetric) latencies.
   def cable(a: SidePorts, b: SidePorts, nLinks: Int, nameHint: String, cfgA: Bool, cfgB: Bool, latAB: Int, latBA: Int): Unit = {
     val period = 2 * nLinks * cyclesPerSlot
-    val execAB = latAB - period - 2; val bypAB = latAB - 3 // a->b wire depths (exec / boot)
-    val execBA = latBA - period - 2; val bypBA = latBA - 3 // b->a wire depths
+    // wire depths: -3 exec / -4 boot (was -2 / -3) absorb the demux io.out pipeline register
+    // so the total crossing stays == latAB/latBA (the compiler's --hop-latencies, unchanged).
+    val execAB = latAB - period - 3; val bypAB = latAB - 4 // a->b wire depths (exec / boot)
+    val execBA = latBA - period - 3; val bypBA = latBA - 4 // b->a wire depths
     require(execAB >= 1, s"cable $nameHint: a->b latency $latAB too small for nLinks=$nLinks (execWire=$execAB)")
     require(execBA >= 1, s"cable $nameHint: b->a latency $latBA too small for nLinks=$nLinks (execWire=$execBA)")
     withClockAndReset(seamClock, reset) {
