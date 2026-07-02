@@ -276,6 +276,26 @@ class MultiChipPerMgmtSimKernel(
       muxOverflows += (bridgeB.io.muxOverflow && !bypassW)
       demuxOverflows += (bridgeA.io.demuxOverflow && !bypassW)
       demuxOverflows += (bridgeB.io.demuxOverflow && !bypassW)
+
+      // DEBUG (seam-direction probe): count each end's transmitted frames and print the
+      // first few plus periodic totals. Distinguishes "b-side (the neighbour's south/west
+      // side) never transmits" from "transmits but is not delivered" when chasing one-way
+      // seam traffic (the rig's sig2=0 / all-RX-frozen symptom).
+      val txCntA = RegInit(0.U(32.W))
+      val txCntB = RegInit(0.U(32.W))
+      when(bridgeA.io.tx.valid) { txCntA := txCntA + 1.U }
+      when(bridgeB.io.tx.valid) { txCntB := txCntB + 1.U }
+      when(bridgeA.io.tx.valid && txCntA < 3.U) {
+        printf(p"[SEAMTX $nameHint A] tag=${bridgeA.io.tx.tag} bypass=$bypassW\n")
+      }
+      when(bridgeB.io.tx.valid && txCntB < 3.U) {
+        printf(p"[SEAMTX $nameHint B] tag=${bridgeB.io.tx.tag} bypass=$bypassW\n")
+      }
+      val dbgTick = RegInit(0.U(64.W))
+      dbgTick := dbgTick + 1.U
+      when(dbgTick(19, 0) === 0.U && dbgTick =/= 0.U) {
+        printf(p"[SEAMCNT $nameHint] A=$txCntA B=$txCntB\n")
+      }
     }
   }
 

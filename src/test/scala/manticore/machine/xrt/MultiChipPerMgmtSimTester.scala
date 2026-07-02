@@ -51,6 +51,13 @@ class MultiChipPerMgmtSimTester extends AnyFlatSpec with ChiselScalatestTester w
   val FINISH = Set(1)
   val goldenVcycles = 1025
   val goldenFlushes = 4
+  // Final seam-crossed sig2: the fully-folded signature after the last $display (cyc 1023). Its
+  // value requires correct cross-chip NoC delivery; this is the data-dependent correctness check.
+  // (The historic (1,0,0) reads were two RTL bugs, both fixed: the Switch's south-turn branches
+  // clobbered terminal_reg — silently dropping same-cycle terminal deliveries — and
+  // MemoryIntercept sampled the gmem request one cycle late, corrupting the display GST burst.
+  // See Pico84SingleChipTester, which now asserts the full golden triple.)
+  val goldenFinalSig2 = 225
   val startMargin = 2000L // totalCycleCount headroom for CMD_START_AT / resume-at-R arming
 
   def cmdWord(cmd: Int, timeout: Long): BigInt = (BigInt(1) << 63) | (BigInt(cmd) << 56) | BigInt(timeout)
@@ -186,6 +193,17 @@ class MultiChipPerMgmtSimTester extends AnyFlatSpec with ChiselScalatestTester w
         dut.io.start(n).poke(true.B)
         dut.clock.step(); dut.io.start(n).poke(false.B)
       }
+      // run ONE command on chip n with the full idle->done handshake (mirrors
+      // Pico84SingleChipTester.run): pulse start, wait to LEAVE idle (command accepted), then wait
+      // for done. Used to drive the post-FINISH cache flush that drains the reporter's last
+      // $display to gmem (issueOne's bare done||idle check would race — the chip is already idle).
+      def runOne(n: Int, base: Int, cmd: BigInt): Unit = {
+        issueOne(n, base, cmd)
+        var guard = 0
+        while (dut.io.idle(n).peekBoolean() && guard < 500000) { dut.clock.step(); guard += 1 }
+        while (!dut.io.done(n).peekBoolean() && guard < 4000000) { dut.clock.step(); guard += 1 }
+        dut.clock.step()
+      }
       // "command complete" = done || idle (the bittide UserCore's chipStopped; under
       // stallWave a FINISH returns the chip to idle without a persistent `done` level).
       def stopped(n: Int): Boolean = dut.io.done(n).peekBoolean() || dut.io.idle(n).peekBoolean()
@@ -281,14 +299,18 @@ class MultiChipPerMgmtSimTester extends AnyFlatSpec with ChiselScalatestTester w
       val muxOvf = dut.io.dbg_seam_overflow.peekBoolean()
       val loss = dut.io.dbg_seam_dataloss.peekBoolean()
       val gateViol = dut.io.dbg_gate_in_flight.peekBoolean()
-      // best-effort: read the reporter's (last) $display trace record for info
+      // Make the pass DATA-DEPENDENT: recover the reporter's FINAL $display (SIG) record. In armed
+      // mode the $display GSTs land in the write-back cache but are never flushed during the run;
+      // the reporter is now halted with its last SIG line still dirty in cache. Drain it with ONE
+      // cache-flush (cmd 2), then read words 0..5 = [sig0_lo,hi, sig1_lo,hi, sig2_lo,hi].
+      runOne(reporter, imgs(reporter).baseM, flushWord)
       val sig = (
         rdMem(reporter, 0) | (rdMem(reporter, 1) << 16),
         rdMem(reporter, 2) | (rdMem(reporter, 3) << 16),
         rdMem(reporter, 4) | (rdMem(reporter, 5) << 16)
       )
       info(s"MAIN (armed) ended after $g cycles: reporter eid=$eid vc=$vc " +
-        s"gateViolation=$gateViol overflow=$muxOvf dataloss=$loss lastSIG=$sig")
+        s"gateViolation=$gateViol overflow=$muxOvf dataloss=$loss finalSIG=$sig")
       info(s"DIAG first-trip: overflow @cyc=$fOvfC vc=$fOvfVc | gateViol @cyc=$fGateC vc=$fGateVc | dataloss @cyc=$fLossC vc=$fLossVc")
       info(s"DIAG vc froze at cyc=$lastVcChangeC vc=$lastVc (frozenFor=$frozenFor); per-chip stop=${(0 until nChips).map(n => s"$n:${stopped(n)}").mkString(",")}")
       info(s"DIAG per-chip vc=${(0 until nChips).map(n => s"$n:${deviceVc(n)}").mkString(",")}")
@@ -297,6 +319,11 @@ class MultiChipPerMgmtSimTester extends AnyFlatSpec with ChiselScalatestTester w
       assert(!gateViol, "seam clock gated while a frame was in flight (stall not on an empty boundary)")
       assert(!loss, "TDM seam demux dropped a packet (real data loss)")
       assert(eid == 1, s"reporter did not reach FINISH (eid=$eid) within $g cycles; vc=$vc")
+      // DATA-DEPENDENT correctness: the final seam-crossed sig2 must reach the golden fold value;
+      // a broken inter-chip NoC would deliver a wrong (or unchanged) sig2 even when the reporter
+      // still reaches FINISH on its fixed cycle schedule. (sig0/sig1 reported, not asserted.)
+      assert(sig._3 == goldenFinalSig2,
+        s"final seam-crossed sig2=${sig._3} != golden $goldenFinalSig2 (full triple $sig)")
       if (vc == goldenVcycles) info(s"vcycles EXACT: $vc")
       else info(s"vcycles=$vc (golden $goldenVcycles) — note: armed FINISH is captured at the deferred stall")
       info(s"VERIFIED (8-IC per-Management, armed stall-wave, asymmetric seams): reached FINISH, no gate-violation, no demux loss")

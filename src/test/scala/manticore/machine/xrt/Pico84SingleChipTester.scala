@@ -113,13 +113,14 @@ class Pico84SingleChipTester extends AnyFlatSpec with ChiselScalatestTester with
         assert(FINISH.contains(eid) && vc == 1025 && flushes == 4,
           s"structural mismatch: eid=$eid vc=$vc flushes=$flushes")
         val golden = Seq((20, 20, 20), (96, 96, 96), (193, 193, 193), (225, 225, 225))
-        // KNOWN ANOMALY (open item): sig0/sig1 read (1, 0) on RTL while sig2 is exact —
-        // an RTL-vs-interpreter divergence in this benchmark, present WITHOUT any seams
-        // (this very test is the proof). sig2 is asserted; the full triple is reported.
-        val sig2 = sigs.map(_._3).toList
-        assert(sig2 == golden.map(_._3).toList, s"sig2 column $sig2 != golden ${golden.map(_._3)}")
-        if (sigs.toSeq == golden) info(s"single-chip 8x4: EXACT value match incl. all SIG values")
-        else info(s"single-chip SIG (golden $golden): got $sigs — sig0/sig1 known RTL anomaly, sig2 exact")
+        // The full triple is asserted. Historic note: sig0/sig1 used to read (1, 0) and
+        // (with the reworked scheduler) sig2 read 0 — root-caused to two RTL bugs, both
+        // fixed: (a) the Switch's south-turn branches clobbered terminal_reg, silently
+        // masking same-cycle terminal deliveries (33/1394 sends per vcycle lost); (b)
+        // MemoryIntercept sampled gmem addr/wdata one cycle after start (a gmem
+        // clock-kill-era contract), corrupting every display GST burst.
+        assert(sigs.toSeq == golden, s"SIG values $sigs != golden $golden")
+        info(s"single-chip 8x4: EXACT value match incl. all SIG values")
       }
   }
 }
