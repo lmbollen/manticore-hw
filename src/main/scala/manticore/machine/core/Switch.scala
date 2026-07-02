@@ -209,11 +209,21 @@ class Switch(DimX: Int, DimY: Int, config: ISA, n_hop: Int) extends Module {
     // both == 0: self-message, drop silently (compiler must not generate these)
   }
 
+  // NOTE on terminal_reg: it must be written IF AND ONLY IF y_reg is written.
+  // y_reg-writing transit/turn branches set it false (they may overwrite a
+  // lower-priority terminal delivery in y_reg — a real, compiler-reserved
+  // conflict). Branches that write OTHER registers (y_neg_reg) must NOT touch
+  // it: a south-turn and a terminal delivery use distinct registers and the
+  // compiler's split-channel reservation model deliberately lets them share a
+  // cycle. Clearing terminal_reg here would silently mask the concurrent
+  // delivery (the packet stays in y_reg but the PE never sees valid) — this
+  // exact bug froze the loop_multi SIG registers (33/1394 transactions per
+  // vcycle silently undelivered on the 8x4 build).
+
   // yNegInput: southbound in-transit or terminal delivery
   when(io.yNegInput.valid) {
     when(io.yNegInput.yHops < 0.S) {
-      y_neg_reg    := NoCBundle.passY(io.yNegInput)  // continue south
-      terminal_reg := false.B
+      y_neg_reg := NoCBundle.passY(io.yNegInput)     // continue south (y_neg_reg only)
     }.otherwise {
       // yHops reached 0: terminal delivery via yOutput regardless of arrival direction
       y_reg        := NoCBundle.terminal(io.yNegInput)
@@ -240,8 +250,7 @@ class Switch(DimX: Int, DimY: Int, config: ISA, n_hop: Int) extends Module {
       y_reg        := NoCBundle.passY(io.xNegInput)  // turn north
       terminal_reg := false.B
     }.elsewhen(io.xNegInput.yHops < 0.S) {
-      y_neg_reg    := NoCBundle.passY(io.xNegInput)  // turn south
-      terminal_reg := false.B
+      y_neg_reg := NoCBundle.passY(io.xNegInput)     // turn south (y_neg_reg only)
     }.otherwise {
       y_reg        := NoCBundle.terminal(io.xNegInput) // terminal
       terminal_reg := true.B
@@ -265,8 +274,7 @@ class Switch(DimX: Int, DimY: Int, config: ISA, n_hop: Int) extends Module {
       y_reg        := NoCBundle.passY(io.xInput)     // turn north
       terminal_reg := false.B
     }.elsewhen(io.xInput.yHops < 0.S) {
-      y_neg_reg    := NoCBundle.passY(io.xInput)     // turn south
-      terminal_reg := false.B
+      y_neg_reg := NoCBundle.passY(io.xInput)        // turn south (y_neg_reg only)
     }.otherwise {
       y_reg        := NoCBundle.terminal(io.xInput)  // terminal
       terminal_reg := true.B
@@ -309,21 +317,73 @@ class SwitchPacketInspector(
     error("self packet detected!")
   }
 
-  // when eastbound X causes Y or L to be dropped
-  when(io.xInput.valid && io.xInput.xHops === 0.S) {
-    when(io.yInput.valid) {
-      error("dropping Y because of X")
-    }
-    when(io.lInput.valid && io.lInput.xHops === 0.S) {
-      error("dropping L because of X")
-    }
+  // EXACT output-register collision detection, transcribed from the Switch's write
+  // structure: for each output register, the set of (input, condition) writers. Two
+  // simultaneous writers = one packet silently dropped (the priority order picks the
+  // winner). Reports every loser with enough identity (dest reg address + hops) to
+  // match it against the compiler's transactions.csv.
+  val wrYbyL    = io.lInput.valid && io.lInput.xHops === 0.S && io.lInput.yHops > 0.S
+  val wrYbyYNeg = io.yNegInput.valid && io.yNegInput.yHops >= 0.S
+  val wrYbyY    = io.yInput.valid
+  val wrYbyXNeg = io.xNegInput.valid && io.xNegInput.xHops === 0.S && io.xNegInput.yHops >= 0.S
+  val wrYbyX    = io.xInput.valid && io.xInput.xHops === 0.S && io.xInput.yHops >= 0.S
+
+  val wrYNbyL    = io.lInput.valid && io.lInput.xHops === 0.S && io.lInput.yHops < 0.S
+  val wrYNbyYNeg = io.yNegInput.valid && io.yNegInput.yHops < 0.S
+  val wrYNbyXNeg = io.xNegInput.valid && io.xNegInput.xHops === 0.S && io.xNegInput.yHops < 0.S
+  val wrYNbyX    = io.xInput.valid && io.xInput.xHops === 0.S && io.xInput.yHops < 0.S
+
+  val wrXbyL = io.lInput.valid && io.lInput.xHops > 0.S
+  val wrXbyX = io.xInput.valid && io.xInput.xHops > 0.S
+
+  val wrXNbyL    = io.lInput.valid && io.lInput.xHops < 0.S
+  val wrXNbyXNeg = io.xNegInput.valid && io.xNegInput.xHops < 0.S
+  val wrXNbyX    = io.xInput.valid && io.xInput.xHops < 0.S
+
+  // y_reg: priority X > XNeg > Y > YNeg > L — every lower-priority writer loses
+  when(wrYbyX && (wrYbyXNeg || wrYbyY || wrYbyYNeg || wrYbyL)) {
+    when(wrYbyXNeg) { error("YREG drop XNeg(addr=%d,x=%d,y=%d) by X(addr=%d)\n", io.xNegInput.address, io.xNegInput.xHops.asUInt, io.xNegInput.yHops.asUInt, io.xInput.address) }
+    when(wrYbyY)    { error("YREG drop Y(addr=%d,y=%d) by X(addr=%d)\n", io.yInput.address, io.yInput.yHops.asUInt, io.xInput.address) }
+    when(wrYbyYNeg) { error("YREG drop YNeg(addr=%d) by X(addr=%d)\n", io.yNegInput.address, io.xInput.address) }
+    when(wrYbyL)    { error("YREG drop L(addr=%d) by X(addr=%d)\n", io.lInput.address, io.xInput.address) }
+  }
+  when(!wrYbyX && wrYbyXNeg && (wrYbyY || wrYbyYNeg || wrYbyL)) {
+    when(wrYbyY)    { error("YREG drop Y(addr=%d,y=%d) by XNeg(addr=%d)\n", io.yInput.address, io.yInput.yHops.asUInt, io.xNegInput.address) }
+    when(wrYbyYNeg) { error("YREG drop YNeg(addr=%d) by XNeg(addr=%d)\n", io.yNegInput.address, io.xNegInput.address) }
+    when(wrYbyL)    { error("YREG drop L(addr=%d) by XNeg(addr=%d)\n", io.lInput.address, io.xNegInput.address) }
+  }
+  when(!wrYbyX && !wrYbyXNeg && wrYbyY && (wrYbyYNeg || wrYbyL)) {
+    when(wrYbyYNeg) { error("YREG drop YNeg(addr=%d) by Y(addr=%d)\n", io.yNegInput.address, io.yInput.address) }
+    when(wrYbyL)    { error("YREG drop L(addr=%d) by Y(addr=%d)\n", io.lInput.address, io.yInput.address) }
+  }
+  when(!wrYbyX && !wrYbyXNeg && !wrYbyY && wrYbyYNeg && wrYbyL) {
+    error("YREG drop L(addr=%d) by YNeg(addr=%d)\n", io.lInput.address, io.yNegInput.address)
   }
 
-  // when northbound Y causes L to be dropped
-  when(io.yInput.valid && io.yInput.yHops === 0.S) {
-    when(io.lInput.valid && io.lInput.xHops === 0.S) {
-      error("dropping local input")
-    }
+  // y_neg_reg
+  when(wrYNbyX && (wrYNbyXNeg || wrYNbyYNeg || wrYNbyL)) {
+    when(wrYNbyXNeg) { error("YNEGREG drop XNeg(addr=%d) by X(addr=%d)\n", io.xNegInput.address, io.xInput.address) }
+    when(wrYNbyYNeg) { error("YNEGREG drop YNeg(addr=%d) by X(addr=%d)\n", io.yNegInput.address, io.xInput.address) }
+    when(wrYNbyL)    { error("YNEGREG drop L(addr=%d) by X(addr=%d)\n", io.lInput.address, io.xInput.address) }
+  }
+  when(!wrYNbyX && wrYNbyXNeg && (wrYNbyYNeg || wrYNbyL)) {
+    when(wrYNbyYNeg) { error("YNEGREG drop YNeg(addr=%d) by XNeg(addr=%d)\n", io.yNegInput.address, io.xNegInput.address) }
+    when(wrYNbyL)    { error("YNEGREG drop L(addr=%d) by XNeg(addr=%d)\n", io.lInput.address, io.xNegInput.address) }
+  }
+  when(!wrYNbyX && !wrYNbyXNeg && wrYNbyYNeg && wrYNbyL) {
+    error("YNEGREG drop L(addr=%d) by YNeg(addr=%d)\n", io.lInput.address, io.yNegInput.address)
+  }
+
+  // x_reg / x_neg_reg
+  when(wrXbyX && wrXbyL) {
+    error("XREG drop L(addr=%d,x=%d) by X(addr=%d,x=%d)\n", io.lInput.address, io.lInput.xHops.asUInt, io.xInput.address, io.xInput.xHops.asUInt)
+  }
+  when(wrXNbyX && (wrXNbyXNeg || wrXNbyL)) {
+    when(wrXNbyXNeg) { error("XNEGREG drop XNeg(addr=%d) by X(addr=%d)\n", io.xNegInput.address, io.xInput.address) }
+    when(wrXNbyL)    { error("XNEGREG drop L(addr=%d) by X(addr=%d)\n", io.lInput.address, io.xInput.address) }
+  }
+  when(!wrXNbyX && wrXNbyXNeg && wrXNbyL) {
+    error("XNEGREG drop L(addr=%d,x=%d) by XNeg(addr=%d,x=%d)\n", io.lInput.address, io.lInput.xHops.asUInt, io.xNegInput.address, io.xNegInput.xHops.asUInt)
   }
 
 }
