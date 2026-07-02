@@ -111,7 +111,9 @@ class MultiChipPerMgmtSimKernel(
       new ManticoreFlatArray(
         chipDimX,
         chipDimY,
-        debug_enable = false,
+        // debug on the reporter chip only: TERM/INJ/GMEM traces for correlating
+        // seam-crossed deliveries against the schedule without 8x the printf cost
+        debug_enable = (n == 0),
         enable_custom_alu,
         torusDimX = gDimX,
         torusDimY = gDimY,

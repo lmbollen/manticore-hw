@@ -429,9 +429,15 @@ class MemoryIntercept extends Module {
     // with neighbouring operands as data). Capturing with RegEnable at the
     // start cycle is gap-2-burst-safe and independent of when an exception
     // gates the compute clock (the capture edge closes the start cycle itself).
-    io.cache.addr  := RegEnable(io.core.addr, io.core.start)
-    io.cache.wdata := RegEnable(io.core.wdata, io.core.start)
-    io.cache.cmd   := RegEnable(io.core.cmd, io.core.start)
+    val req_addr_q  = RegEnable(io.core.addr, io.core.start)
+    val req_wdata_q = RegEnable(io.core.wdata, io.core.start)
+    val req_cmd_q   = RegEnable(io.core.cmd, io.core.start)
+    req_addr_q.suggestName("gmem_req_addr_q")
+    req_wdata_q.suggestName("gmem_req_wdata_q")
+    req_cmd_q.suggestName("gmem_req_cmd_q")
+    io.cache.addr  := req_addr_q
+    io.cache.wdata := req_wdata_q
+    io.cache.cmd   := req_cmd_q
     io.cache.start := RegNext(io.core.start, false.B)
   } otherwise {
     io.cache <> io.boot
