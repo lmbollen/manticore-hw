@@ -450,6 +450,27 @@ class Processor(
   fetch_stage.io.is_final_instruction := (countdown_timer === 1.U)
   io.periphery.active                 := (state === ProcessorPhase.StaticExecutionPhase)
 
+  if (debug_enable) {
+    // NoC-injection trace: every packet absorbed during execution (written as a
+    // SET into the epilogue region at program_pointer) — correlates the arrival
+    // order/slots against the compiler's expected receives.
+    when(io.packet_in.valid && state === ProcessorPhase.StaticExecutionPhase) {
+      dprintf(
+        "INJ ptr=%d addr=%d data=%d\n",
+        program_pointer,
+        io.packet_in.address,
+        io.packet_in.data
+      )
+    }
+    // Register-file write trace, reporter core only (volume): shows whether the
+    // injected SETs and the display-state MOVs actually commit their values.
+    if (name_tag == "CoreX0Y0") {
+      when(register_file.io.w.en) {
+        dprintf("RFW addr=%d data=%d\n", register_file.io.w.addr, register_file.io.w.din)
+      }
+    }
+  }
+
   class RegisterWriteByPass extends Bundle {
     val value   = UInt(config.DataBits.W)
     val address = UInt(config.IdBits.W)

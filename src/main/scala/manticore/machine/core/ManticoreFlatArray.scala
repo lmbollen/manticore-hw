@@ -266,7 +266,7 @@ class ComputeArray(
             DimY = dimy,
             config = ManticoreBaseISA,
             pos = (x, y),
-            fatal = true
+            fatal = false
           )
         )
         val debug_time = RegInit(UInt(64.W), 0.U)
@@ -291,6 +291,34 @@ class ComputeArray(
         }
         switch_watcher.io.lInput := cores(x)(y).core.io.packet_out
 
+        // Terminal-delivery + activation trace: one line per NoC terminal delivery
+        // (cycle, dest core, dest register, value) and per core-activation rising
+        // edge, for offline correlation against the compiler's transactions.csv
+        // (expectedRecv column) when hunting schedule-vs-RTL arrival divergences.
+        when(cores(x)(y).switch.io.terminal) {
+          printf(
+            p"[TERM $x $y] cyc=${debug_time} reg=${cores(x)(y).switch.io.yOutput.address} data=${cores(x)(y).switch.io.yOutput.data}\n"
+          )
+        }
+        when(cores(x)(y).core.io.packet_out.valid) {
+          printf(
+            p"[SENDOUT $x $y] cyc=${debug_time} reg=${cores(x)(y).core.io.packet_out.address} xh=${cores(x)(y).core.io.packet_out.xHops} yh=${cores(x)(y).core.io.packet_out.yHops}\n"
+          )
+        }
+        // Hop-by-hop transit trace: every switch output channel, so a lost packet's
+        // last-seen location is visible.
+        def outProbe(tag: String, p: NoCBundle): Unit = when(p.valid) {
+          printf(p"[$tag $x $y] cyc=${debug_time} reg=${p.address} xh=${p.xHops} yh=${p.yHops}\n")
+        }
+        outProbe("XOUT", cores(x)(y).switch.io.xOutput)
+        outProbe("XNOUT", cores(x)(y).switch.io.xNegOutput)
+        outProbe("YOUT", cores(x)(y).switch.io.yOutput)
+        outProbe("YNOUT", cores(x)(y).switch.io.yNegOutput)
+        val act_prev = RegNext(cores(x)(y).core.io.periphery.active, false.B)
+        when(cores(x)(y).core.io.periphery.active && !act_prev) {
+          printf(p"[ACT $x $y] cyc=${debug_time}\n")
+        }
+
       } else {
         cores(x)(y).core.io.periphery.debug_time := 0.U
       }
@@ -308,6 +336,18 @@ class ComputeArray(
     val master_core = cores.flatten.filter(c => hasMemory(c.x, c.y)).head
 
     master_core.core.io.periphery.cache <> io.mem_access
+
+    if (debug_enable) {
+      // Global-memory request trace: every cache-front request the master core
+      // issues (GST/GLD/flush traffic), to verify display stores reach gmem.
+      val gmem_time = RegInit(UInt(64.W), 0.U)
+      gmem_time := gmem_time + 1.U
+      when(master_core.core.io.periphery.cache.start) {
+        printf(
+          p"[GMEM] cyc=${gmem_time} cmd=${master_core.core.io.periphery.cache.cmd.asUInt} addr=${master_core.core.io.periphery.cache.addr} wdata=${master_core.core.io.periphery.cache.wdata}\n"
+        )
+      }
+    }
 
     // connect the configuration packet to the master core switch
     when(io.config_enable) {
@@ -455,6 +495,20 @@ class ManticoreFlatArray(
 
   memory_intercept.io.core_clock    := io.compute_clock
   memory_intercept.io.config_enable := controller.io.config_enable
+
+  if (debug_enable) {
+    // Backend-side gmem request trace (control clock domain): what actually
+    // leaves the MemoryIntercept toward the gmem backend.
+    withClockAndReset(clock = io.control_clock, reset = io.reset) {
+      val bend_time = RegInit(UInt(64.W), 0.U)
+      bend_time := bend_time + 1.U
+      when(io.memory_backend.start) {
+        printf(
+          p"[BEND] cyc=${bend_time} cmd=${io.memory_backend.cmd.asUInt} addr=${io.memory_backend.addr} wdata=${io.memory_backend.wdata} cfg=${controller.io.config_enable}\n"
+        )
+      }
+    }
+  }
 
   controller.io.exception_id            := compute_array.io.exception_id
   controller.io.core_exception_occurred := compute_array.io.exception_occurred
