@@ -3,6 +3,16 @@
 Running log of every file added or modified for the KCU105 port, with rationale.
 Status legend: ✅ done · 🚧 in progress · ⬜ planned.
 
+> **[Updated 2026-06-30]** The early **P1/P3** entries below describe an AXI-master +
+> write-back **cache** global memory (`ManticoreFlatKernel.v` with `m_axi_bank_0`, a 256-bit
+> AXI BRAM controller, a 2×2 SmartConnect). That architecture was **superseded** (commit
+> `7a30727`): the kernel is now **`ManticoreFlatBramKernel.v`** with an **in-kernel
+> `TrueDualPortBram`** (`GmemBramBackend`, no cache, no AXI master), exported as a
+> **GMEM** BRAM-controller port at AXI `0x0`; the block design is a **1-master (jtag) × 2-slave
+> SmartConnect** and `ap_clk` is **100 MHz**. Inline `[Updated 2026-06-30]` notes flag the
+> superseded P1/P3 details. Also note the `$display`/trace-readback item flagged "open" in some
+> entries is now **FIXED and board-verified** (see `VERIFICATION.md`).
+
 ## P0 — nix toolchain ✅
 
 - **`flake.nix`** (new) — dev shell providing the Chisel toolchain: `sbt` + **Temurin
@@ -40,8 +50,20 @@ Resource estimate, 2×2 grid, BRAM-mapped: ~104 / 600 BRAM36 (~17%).
   blackbox bodies (`BRAMLike.v`, `AluDsp48.v`, `ClockDistribution.v`). Top ports:
   `ap_clk`, `ap_rst_n`, `m_axi_bank_0_*` (AXI4 256b data/64b addr), `s_axi_control_*`
   (AXI4-Lite 8b addr/32b data), `interrupt`.
+  > **[Updated 2026-06-30]** Superseded: `KCU105Generator` now emits
+  > **`ManticoreFlatBramKernel.v`** (`xrt/Kcu105Kernel.scala`). There is **no `m_axi_bank_0`**
+  > master; the kernel instead exports an in-kernel BRAM as a 32-bit **GMEM** port group
+  > (`gmem_clk/rst/en/we/addr/din/dout`) alongside `s_axi_control_*`, `interrupt`, and the
+  > `TrueDualPortBram` blackbox body.
 
 ## P3 — Vivado project / bitstream ✅ (REAL xcku040 bitstream; timing met)
+
+> **[Updated 2026-06-30]** This entry records the **original** cache + 256-bit-AXI + 2×2
+> SmartConnect build at ap_clk 200. As built today the block design is a **1-master (jtag) ×
+> 2-slave SmartConnect** (slaves = the gmem `axi_bram_ctrl` and `s_axi_control`); the external
+> `axi_bram_ctrl` is **32-bit** and connects to the kernel's exported **GMEM** port
+> (`axi_bram_ctrl_0/BRAM_PORTA → kernel_0/GMEM`, it does not back a kernel AXI master), and
+> **ap_clk default is 100 MHz** (`build_kcu105.tcl:41`).
 
 **Source the LICENSED Vivado** for the real part:
 `/opt/tools/Xilinx/VivadoEnterprise/Vivado/2022.1/settings64.sh` (the plain
@@ -69,6 +91,11 @@ stand-in builds there).
   interfaces auto-inferred — no IP packaging needed). Writes `pins.xdc`
   (AK17/AK16 sysclk_300, AN8 cpu_reset) and runs synth/impl/`write_bitstream`.
   Auto-falls back to the installed `xcku035-ffva1156-2-e` stand-in when xcku040 is absent.
+  > **[Updated 2026-06-30]** As built the SmartConnect is **1 SI × 2 MI** (`NUM_SI=1`,
+  > `NUM_MI=2`, tcl:133-135): jtag_axi → SmartConnect, M00 → the gmem `axi_bram_ctrl` (32-bit,
+  > whose `BRAM_PORTA` connects to the kernel's exported **GMEM** port, tcl:149-150), M01 →
+  > `s_axi_control` (tcl:170). There is no kernel AXI master and no block-automation BRAM
+  > (the BRAM is inside the kernel). ap_clk default 100 MHz.
 - Address map: BRAM `Mem0` @ 0x0 (= `DramBank0Base`), `s_axi_control` @ 0x0010_0000
   (jtag only; pruned from the kernel master's space).
 

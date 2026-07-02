@@ -1,5 +1,15 @@
 # Porting Manticore to the KCU105 (XCKU040) — Plan
 
+> **[Updated 2026-06-30]** This is the **original pre-implementation plan**. The
+> architecture changed substantially during implementation: the AXI-master + write-back
+> **cache** global-memory design described below was **replaced by an in-kernel
+> fixed-latency `TrueDualPortBram`** (`ManticoreFlatBramKernel`, no `m_axi_bank_0`, no
+> cache; gmem exported as a BRAM-controller GMEM port at AXI `0x0`), and default clocks
+> dropped to **100/100 MHz**. The board bring-up and a MIPS32-to-completion run are now
+> **done** on real xcku040 (board = `gronau.local`). Read this file for the *motivation
+> and contract*; for the **as-built** state see `CHANGES.md` and `VERIFICATION.md`.
+> Inline `[Updated 2026-06-30]` notes flag the specific superseded claims below.
+
 ## Goal
 
 Run a **trivial reproducer** of the Manticore RTL-simulation accelerator (the paper's
@@ -24,12 +34,21 @@ program on the board comes after, once the board is physically available.
   (Also forced by tooling: only Vivado 2022.1 is installed here — no Vitis 2022.1, no
   XRT, no Alveo platforms.)
 - **On-chip BRAM** backs the kernel's `m_axi_bank_0` memory master (no DDR in phase 1).
+  > **[Updated 2026-06-30]** Superseded: there is **no `m_axi_bank_0` master and no cache**
+  > anymore. Global memory is an **in-kernel `TrueDualPortBram`** (`GmemBramBackend`),
+  > exported as a BRAM-controller **GMEM** port at AXI `0x0`. An external `axi_bram_ctrl`
+  > simply fronts that exported port for the JTAG host.
 - **JTAG-to-AXI master** replaces the XRT host: a Vivado Tcl script writes the program
   image into the BRAM and pokes `s_axi_control` to start the device and read results.
 
 ## What the kernel needs from its environment (and how we supply it)
 
 The Manticore RTL itself is board-agnostic. Vitis/XRT only provided the *environment*:
+
+> **[Updated 2026-06-30]** Superseded boundary. The shipped kernel is
+> `ManticoreFlatBramKernel`: the `m_axi_bank_0` row no longer exists (no AXI master, no
+> cache); instead the kernel exports an in-kernel BRAM as a **GMEM** port-group that an
+> external `axi_bram_ctrl` fronts. `ap_clk` default is **100 MHz** (not 300). See below.
 
 | Kernel boundary (from `ManticoreFlatKernel`) | XRT/Alveo supplied | KCU105 replacement |
 |---|---|---|
@@ -43,6 +62,10 @@ The Manticore RTL itself is board-agnostic. Vitis/XRT only provided the *environ
 Everything else — cores, NoC, switches, cache, bootloader (`Programmer`), the
 `AxiSlave` control register file, the internal `ClockDistribution` (clk_wiz) and the AXI
 clock-domain crossings — is reused **verbatim**.
+> **[Updated 2026-06-30]** As built, the **cache** and the 256-bit AXI clock-crosser were
+> **dropped** (the gmem is in-kernel BRAM via `GmemBramBackend`); the bootloader's
+> `memory_backend` now talks to that BRAM directly. The cores/NoC/switches, `AxiSlave`,
+> `ClockDistribution`, and the AXI-Lite control crosser are still reused verbatim.
 
 ## Device↔host contract (what the JTAG driver must do)
 
@@ -72,13 +95,19 @@ takes 8 bytes, 64-bit/pointer regs take 12). Confirmed map:
 | VirtualCycleCount | 0x38 | 64 | dev→host |
 | BootloaderCycleCount | 0x44 | 32 | dev→host |
 | ClockStalls | 0x4c | 32 | dev→host |
-| CacheHits/Misses/Stalls | 0x54/0x5c/0x64 | 32 | dev→host |
+| CacheHits/Misses/Stalls | 0x54/0x5c/0x64 | 32 | dev→host (**[Updated 2026-06-30]** hardwired to 0 on the cacheless build, `Kcu105Kernel.scala:129-131`) |
 | ScheduleConfig | 0x6c | 64 | host→dev |
 | TraceDumpBase | 0x78 | 64 | host→dev |
 | GlobalMemoryInstructionBase | 0x84 | 64 | host→dev |
 | DramBank0Base | 0x90 | 64 | host→dev |
 
 ## Phases
+
+> **[Updated 2026-06-30]** All four phases are **done** (P4 board bring-up + a
+> MIPS32-to-completion run on real xcku040, `gronau.local`). The as-built kernel emits
+> **`ManticoreFlatBramKernel.v`** (not `ManticoreFlatKernel.v`) with an in-kernel BRAM and
+> **no** 256-bit AXI BRAM controller path; the external BRAM controller is 32-bit, fronting
+> the GMEM port. See `CHANGES.md` for the concrete as-built block design.
 
 - **P0 — nix toolchain.** DONE. `manticore-hw/flake.nix` + `.envrc`; `nix develop` → `sbt`
   works (Temurin JDK 11). Vivado stays external (`source .../2022.1/settings64.sh`).
@@ -99,6 +128,10 @@ takes 8 bytes, 64-bit/pointer regs take 12). Confirmed map:
 - `enable_custom_alu = false` for bring-up (fewer DSPs / simpler), revisit later.
 - Internal compute/control clock (`freqMhz`): **low (e.g. 100 MHz)** for easy timing;
   `ap_clk` stays **300 MHz** to match `clk_dist`'s `PRIM_IN_FREQ`.
+  > **[Updated 2026-06-30]** As built the defaults are **ap_clk 100 MHz / compute 100 MHz**
+  > (`build_kcu105.tcl:41-42`). The board 300 MHz diff clock is divided down to ap_clk by the
+  > BD clk_wiz; ap_clk was dropped from 200→100 once the in-kernel BRAM removed the 256-bit
+  > AXI path (the gmem port-A output path is structurally marginal at 200 MHz).
 
 ## Which Vivado to source (licensing)
 

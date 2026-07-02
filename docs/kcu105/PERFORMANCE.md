@@ -4,7 +4,18 @@ We reshaped the Manticore array from **2×2 (4 cores)** to **4×4 (16 cores)** t
 the xcku040 without pushing place-and-route to the edge. This records the measured numbers and what
 they mean for performance.
 
+> **[Updated 2026-06-30]** All resource/timing figures in this doc were measured on the **older
+> KCU105 architecture** — *with* the write-back **cache** and the 256-bit **`m_axi`** master
+> (external `axi_bram_ctrl` + AXI clock crossers), at **ap_clk 200 / compute 100 MHz**. That
+> architecture has since been replaced by an **in-kernel fixed-latency BRAM** (`GmemBramBackend`,
+> no cache, no AXI master) and the **default clocks are now 100/100 MHz** (`build_kcu105.tcl:41`).
+> Resource use therefore differs (no cache, no AXI clock converters, gmem BRAM now inside the
+> kernel) and the numbers below should be treated as **not re-measured** for the current build.
+
 ## Resource utilization (xcku040-ffva1156-2-e, ap_clk 200 MHz / compute 100 MHz)
+
+> **[Updated 2026-06-30]** Old architecture (cache + 256-bit `m_axi`). Current default is
+> 100/100 MHz with in-kernel BRAM and no cache/AXI crossers — figures below not re-measured.
 
 | Grid | Cores | BRAM tiles (of 600) | LUT (of 242k) | FF (of 485k) | DSP | Source |
 |---|---:|---:|---:|---:|---:|---|
@@ -20,6 +31,10 @@ controller/IPs); consistent with the earlier xcku035 stand-in build (31% of 540)
 4× the compute of the 2×2 while keeping ~36% headroom, so PnR closes comfortably. 5×5 overflows.
 
 ## Timing (200/100 MHz)
+
+> **[Updated 2026-06-30]** Measured on the old cache + `m_axi` build at 200/100 MHz; the current
+> default is 100/100 MHz (the in-kernel gmem BRAM's port-A path was marginal at 200 MHz). Treat
+> the slacks below as historical for that architecture.
 
 | Grid | Setup WNS | Hold WHS | Status |
 |---|---:|---:|---|
@@ -92,6 +107,11 @@ is a fraction of the VU9P and we run the compute clock 5× slower. Two honest fr
 - Next levers if more performance is wanted: **raise the compute clock** (positive setup slack
   suggests room beyond 100 MHz) and, per OFFCHIP-ELIMINATION.md, **reclaim the smartconnect/cache
   area** (~8k LUT + ~70 BRAM) to push toward 5×5 once the BRAM bank is removed.
+  > **[Updated 2026-06-30]** Partly done: the **cache** is already gone (replaced by in-kernel
+  > BRAM). The **smartconnect/`axi_bram_ctrl`** are still present (now the JTAG host window onto
+  > the GMEM port), so their LUT is not yet reclaimed — that needs a different host bring-up.
 
-Artifacts: bitstream at `/tmp/manticore_4x4_build/.../impl_1/system_wrapper.bit`; reports in the same
-`impl_1/` dir (`*_utilization_placed.rpt`, `*_timing_summary_routed.rpt`).
+Artifacts: rebuild via `build_kcu105.tcl` into a chosen `<build_dir>`; the bitstream and reports
+land in `<build_dir>/manticore_kcu105.runs/impl_1/` (`system_wrapper.bit`,
+`*_utilization_placed.rpt`, `*_timing_summary_routed.rpt`). (The original run used a volatile
+`/tmp/...` build dir — not a stable path.)

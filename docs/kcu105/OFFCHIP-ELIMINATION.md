@@ -5,12 +5,26 @@ mechanism — **not** by backing it with BRAM (which is what the KCU105 port cur
 `axi_bram_ctrl`), but by removing the reliance itself. This documents what off-chip storage is
 used for, the consequences of removing it, and the concrete changes required.
 
+> **[Updated 2026-06-30]** Partly overtaken by events. This doc's premise — that the KCU105
+> *cache + 256-bit AXI master* are still present (DRAM emulated behind `axi_bram_ctrl`) — is
+> **no longer true**: the cache and AXI master were **already removed** (commit `7a30727`).
+> Global memory is now an **in-kernel fixed-latency `TrueDualPortBram`** fed directly by
+> `GmemBramBackend` (no cache), exported as a **GMEM** BRAM-controller port; the external
+> `axi_bram_ctrl` + `smartconnect` are **retained only as the JTAG host window** (so their LUT
+> was *not* reclaimed). The `$display`/trace-store path that this doc cites as broken is also
+> **fixed and board-verified** (`VERIFICATION.md`). What remains **genuinely open** is the
+> deeper step: building the cores with **`WithGlobalMemory=false`** (scratchpad-only) so role
+> **A** is compiled out — that part of this doc is still current. Inline `[Updated 2026-06-30]`
+> notes mark the superseded items below.
+
 ## 1. What off-chip storage (global memory) actually does
 
 In Manticore, "off-chip storage" = the **global memory**: a single privileged core is connected
 to a write-back **cache** which is backed by an off-chip **DRAM bank** (paper §5.2). On the KCU105
-we replaced that DRAM bank with on-chip BRAM behind an `axi_bram_ctrl`. Global memory serves
-**three distinct roles** — important, because they have very different consequences:
+we replaced that DRAM bank with on-chip BRAM behind an `axi_bram_ctrl`. (**[Updated 2026-06-30]**
+the cache itself is now gone too — the privileged core talks to the in-kernel BRAM directly via
+`GmemBramBackend`; see top note.) Global memory serves **three distinct roles** — important,
+because they have very different consequences:
 
 | # | Role | Mechanism | Who depends on it |
 |---|---|---|---|
@@ -49,9 +63,11 @@ Instructions currently transit DRAM. Without it, the program must reach the core
 (options in §3). The PEs are unaffected — they only ever see instructions as NoC config packets.
 
 ### C. `$display`/trace + result readback lose their channel
-The host-inspect path (write trace to DRAM, host reads it) disappears. (In our 2×2/board harness
-this path is *already* non-functional — the store-drain bug in `VERIFICATION.md` — so this is also
-a chance to replace it with something that works.)
+The host-inspect path (write trace to DRAM, host reads it) disappears.
+> **[Updated 2026-06-30]** This previously claimed the path was *already non-functional* (a
+> store-drain bug). That bug is **fixed and board-verified** (`VERIFICATION.md`): the trace now
+> reads back the exact interpreter values. So removing role C is a deliberate trade-off, not a
+> way to dodge a broken path.
 
 ## 3. Required changes
 
@@ -62,6 +78,12 @@ a chance to replace it with something that works.)
 2. **Delete the cache + off-chip bank.** Remove `CacheSubsystem`/`AxiCacheAdapter` and, on the
    KCU105, the `axi_bram_ctrl` + `smartconnect` + the `m_axi` clock converters from the block
    design (`Kernel.scala` KCU105 generator + `vivado/kcu105/build_kcu105.tcl`).
+   > **[Updated 2026-06-30]** ✅ **Mostly implemented** for the KCU105: the kernel-side
+   > `CacheSubsystem`/`AxiCacheAdapter` and the 256-bit `m_axi` master + its clock converter are
+   > **gone** (kernel is `ManticoreFlatBramKernel`; gmem is in-kernel BRAM via `GmemBramBackend`).
+   > The `axi_bram_ctrl` + `smartconnect` are **deliberately kept** — they now serve only as the
+   > JTAG host path onto the kernel's GMEM port (no LUT reclaimed; see §4). What is *not* yet done
+   > is item 1 (cores at `WithGlobalMemory=false`), which is the remaining genuine step.
 3. **Re-home boot (role B).** Repoint `Programmer.io.memory_backend` from the cache to either:
    - (i) an on-chip **program BRAM initialised at bitstream build** (MEMORY_INIT) → *fixed-program*
      bitstream (rebuild to change the simulated design). Simplest; no host loader, no off-chip.
@@ -79,6 +101,9 @@ a chance to replace it with something that works.)
 5. **Keep global clock-gating only for exceptions.** The clock-gating mechanism is used for both
    cache-stall *and* precise-exception stall (paper §5.2). Removing the cache removes the
    cache-stall use; keep the exception-stall use.
+   > **[Updated 2026-06-30]** ✅ Already the case on the KCU105: with the cache gone there is
+   > **no gmem clock-kill** (`Kcu105Kernel.scala` header) — the fixed-latency BRAM never stalls;
+   > the exception-stall clock-gating is retained.
 
 ### Compiler (`manticore-compiler`)
 1. Drive a **no-global-memory hardware config** so the scheduler/codegen never emit global
@@ -110,6 +135,13 @@ xcku040 (measured from the 3×3 synth, sum of OOC runs):
 | AXI clock converters | ~740 | 0 |
 | cache (`CacheSubsystem`, part of kernel) | (in kernel) | **4 URAM-equiv (~8–16 BRAM)** |
 
+> **[Updated 2026-06-30]** As built, only some of this was reclaimed. The **cache** and the
+> **256-bit AXI clock converter** are gone (kernel-internal savings realized). But the
+> **`smartconnect` and `axi_bram_ctrl` are retained** — they are the JTAG host path onto the
+> in-kernel BRAM's GMEM port — so the ~7,950 LUT + ~440 LUT/~64 BRAM rows are **not** yet
+> reclaimed. They would only come back with a different host bring-up (e.g. JTAG straight to a
+> staging BRAM), per item 3 below.
+
 For scale, the entire **9-core kernel is ~7,110 LUT** — i.e. the `smartconnect` alone costs *more
 LUTs than the compute array*. Reclaiming it (plus ~70+ BRAM tiles) directly buys **more cores**
 and/or eases PnR, and removing the cache-stall path off the global timing net should help **Fmax**.
@@ -122,8 +154,9 @@ and/or eases PnR, and removing the cache-stall path off the global timing net sh
 - **Recommended target:** a **scratchpad-only Manticore** for on-chip-fitting designs (the paper's
   regime): cores at `WithGlobalMemory=false`, **boot from a JTAG-loaded on-chip program BRAM**
   (keeps reconfigurability, no off-chip), and **traces via a JTAG-readable FIFO** *or* dropped in
-  favour of self-checking-via-exception + scratchpad readback (which also sidesteps the broken
-  trace-store path).
+  favour of self-checking-via-exception + scratchpad readback. (**[Updated 2026-06-30]** the
+  earlier note that this "sidesteps the broken trace-store path" no longer applies — that path is
+  fixed; dropping global-memory traces is now a deliberate simplification, not a workaround.)
 - **The one thing you give up** is large-memory designs. Make that explicit at compile time so it
   fails loudly rather than silently requiring DRAM.
 - **What you gain:** a simpler, fully-deterministic PE with no cache-stall path, a chunk of LUT and

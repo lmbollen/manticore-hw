@@ -106,6 +106,16 @@ instrumentation of `MemoryIntercept` (2026-06-11) found the actual causes:
    one-store-behind shift). Fix: pass addr/wdata/cmd through combinationally; the pins are
    frozen-stable from `sReq` until the post-`done` revive.
 
+   > **[Reversed 2026-07-02]** The combinational pass-through was itself a bug once the gmem
+   > clock-kill was removed (fixed-latency BRAM backend): with the compute clock free-running,
+   > the pins one cycle after `start` carry the NEXT instruction's operand flow — `Execute`
+   > registers the whole request bundle (`gmem_if_reg` + RegNext3), so all fields are valid
+   > exactly AT `start`. Dense display-GST bursts (loop_multi's six SIG stores) wrote neighbouring
+   > operands to scattered addresses; Mips32's sparse displays passed by schedule luck.
+   > `MemoryIntercept` now captures addr/wdata/cmd with `RegEnable(_, io.core.start)` and fires
+   > the backend one cycle later — same timing, correct values, burst-safe, and independent of
+   > when an exception gates the compute clock.
+
 3. As a safety net, Management's exception exit now waits for any in-flight store:
    `MemoryIntercept` exports `pending`, and `sVirtualCycle` defers `sDone` (holding the compute
    clock gated, the cache mux on the core, and `config_enable` low) until the drain completes —
@@ -136,6 +146,10 @@ this argument is moot for the sim: the literal `RF[2]` values are read back and 
 - **`manticore-hw/.../xrt/Kernel.scala`** — `ManticoreFlatSimKernel` gained diagnostic outputs
   `dbg_axi_writes`, `dbg_last_awaddr`, `dbg_last_wdata` (count/inspect cache writebacks). Harmless
   to the real kernel/bitstream (sim-only kernel).
+  > **[Updated 2026-06-30]** The verified KCU105 gmem backend is now **`GmemBramBackend`** (an
+  > in-kernel fixed-latency BRAM, **no cache / no AXI master**). These `dbg_axi_*` "cache
+  > writeback" counters therefore reflect the **older cache-based sim kernel**; the trace
+  > correctness conclusions above still hold (re-confirmed against the BRAM backend).
 - **`manticore-hw/.../xrt/Mips32SimTester.scala`** (new) — the self-checking regression: loads the
   image via DMI, runs initializers + main with the cache-flush/resume schedule, and asserts the
   exact golden signature (53 vcycles / 31 displays / eid 3). Records the trace-readback gap.
