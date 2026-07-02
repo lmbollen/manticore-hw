@@ -415,19 +415,23 @@ class MemoryIntercept extends Module {
   io.cache.start := false.B
 
   when(!io.config_enable) {
-    // PASS THROUGH, do not latch at io.core.start: the core's gmem address/wdata
-    // settle at its pins one compute cycle AFTER gmem.start (Execute aligns start
-    // via RegNext(opcode) but addr/wdata come straight from the register file
-    // reads). So the backend request fires one cycle after io.core.start, with
-    // the address/wdata combinationally passed from the (settled) pins. If an
-    // exception gates the compute clock meanwhile, the BUFGCE freeze holds the
-    // pins ON the settled values, so this control-clock capture still reads the
-    // correct request (see docs/kcu105/MISSED-DISPLAY-TIMING.md /
-    // VERIFICATION.md for the one-behind failure mode that latching at the
-    // start cycle causes).
-    io.cache.addr  := io.core.addr
-    io.cache.wdata := io.core.wdata
-    io.cache.cmd   := io.core.cmd
+    // Capture the request AT io.core.start and fire the backend one cycle later.
+    // Execute carries the whole gmem request (start+addr+wdata+cmd) through ONE
+    // register bundle (gmem_if_reg + RegNext3), so all fields are valid exactly
+    // in the start cycle and are overwritten by the next instruction's operand
+    // flow one cycle later. The previous combinational pass-through (sampling
+    // the pins at start+1) dated from the gmem clock-kill era, when the access
+    // itself froze the compute clock right after start and the pins stayed
+    // parked on the request; with the fixed-latency BRAM backend the compute
+    // clock keeps running and that late sample reads the NEXT instruction's
+    // register-file values — every burst of display GSTs wrote garbage
+    // addresses/data (observed: the SIG trace words scattered to addr 0/2^32
+    // with neighbouring operands as data). Capturing with RegEnable at the
+    // start cycle is gap-2-burst-safe and independent of when an exception
+    // gates the compute clock (the capture edge closes the start cycle itself).
+    io.cache.addr  := RegEnable(io.core.addr, io.core.start)
+    io.cache.wdata := RegEnable(io.core.wdata, io.core.start)
+    io.cache.cmd   := RegEnable(io.core.cmd, io.core.start)
     io.cache.start := RegNext(io.core.start, false.B)
   } otherwise {
     io.cache <> io.boot
