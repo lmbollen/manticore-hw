@@ -1,6 +1,6 @@
 # The seam problem — SOLVED (2026-07-06)
 
-**Resolution.** Three stacked root causes; the first two were found via the
+**Resolution.** Five stacked root causes (two in the compiler/sim stack, one in the latencies derivation, one in the driver's boot sequencing, one in the bittide transceiver stack); the first two were found via the
 sim-as-baseline frame-conservation hunt, after which the 8-chip demo sim
 passed its full data-dependent golden for the first time — `SIG =
 (225,225,225)`, `CHK = (128,11707,115475)`, FINISH at vc 1033, zero
@@ -59,6 +59,54 @@ stays green).
    is correct for its own taps. Fixed as a Manticore-specific
    `seamInternalDelay = −2` in `ManticoreDemo/Latencies.hs` (all 160
    directed seam rows move up by exactly 2).
+
+4. **Rig-only: the driver booted chips with their seams extended**
+   (bittide-hardware `f4516321`). The sim kernel has gated `extend=false`
+   around per-chip boots since the ic5 body-truncation fix — explicitly
+   marked sim-only because the real chip's extend bits are
+   driver-controlled — but the driver never did the equivalent: boot NoC
+   frames could leak across live seams, and frames left frozen in the
+   boundary bridges by a stall-gated run thawed into the next boot
+   (reload-boots hung; the sweep runs proved gating cures them). Every
+   coordinated phase now retracts all extends (edges U-turn — the
+   per-chip boot topology the split images are built for), arms, settles,
+   verifies every chip parked in `sResumeWait`, re-extends, and ungates
+   together at S over clean seams.
+
+5. **Rig-only, CONFIRMED with direct counters: the bittide transceiver
+   ResetManager never disarms and a single post-init line error kills a
+   groomed link pair** (bittide-hardware `Bittide.Transceiver`:
+   `errorAfterRxInitDone = mux rxDataInitDone rxCtrlOrError (pure False)`
+   feeding the `Monitor` state of `ResetManager`, whose own in-code TODO
+   acknowledges the gap). One 8b/10b coding/disparity/control-symbol
+   error on any channel — content-independent line noise; trips hit
+   non-seam channels too — sends `Monitor -> ResetUserTx`: the channel's
+   TX falls back to commas/PRBS mid-application, the partner's RX counts
+   those as errors and trips as well, the pair re-locks at the
+   transceiver layer (rx/tx_data_init_dones read all-ones afterwards) —
+   but auto-centering is stopped after grooming, so the elastic buffers
+   come back railed and the fabric-level RX stream stays PERMANENTLY
+   frozen at a handshake-era word with a pinned datacount. EBMON is
+   structurally blind to it (a frozen counter never crosses a
+   watermark). Per-boot roulette: one dead direction in run 28808445252
+   (seam ILA: node2->node0, 116 frames TX'd, 0 arrive), ~17/20 seam
+   directions in run 28812004895 (rig-wide RX ring-buffer map), seven
+   `failAfterUps` trips with exact partner `rxRetries=8/rxFullRetries=1`
+   pairing in run 28813504842 (transceiver statistics dump). The
+   reporter's north feed (node2->node0, plausibly the fiber-spool cable
+   = worst eye) died in all three observed boots — severing every
+   signature chain: seam-crossed SIG=(0,0,0) exactly, while chip-local
+   CHK, grooming (pre-trip), the margin-padded stall wave and the
+   (short-running) WireDemo all stay green.
+
+   Fix options (core-library decision): (1) RTL — implement the
+   ResetManager TODO: latch `Monitor` on failure / gate
+   `errorAfterRxUser` once commissioned, so transient errors do not nuke
+   groomed links; (2) firmware — poll `failAfterUps` + EB liveness and
+   re-groom (requires keeping re-centering alive); (3) driver — a
+   fail-fast pre-CMD_START gate on `failAfterUps == 0` everywhere,
+   turning silent data death into a loud, retryable bring-up failure.
+   Recommended: (1) + (3).
 
 **What the hunt verified along the way** (the bittide abstraction holds):
 the TDM link core is exact at T ∈ {15, 71, 122, 1298} in directed tests
