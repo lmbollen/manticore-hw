@@ -273,23 +273,15 @@ class ComputeArray(
         debug_time                               := debug_time + 1.U
         cores(x)(y).core.io.periphery.debug_time := debug_time
 
-        switch_watcher.io.xInput := {
-          if (x == 0) cores(dimx - 1)(y).switch.io.xOutput
-          else cores(x - 1)(y).switch.io.xOutput
-        }
-        switch_watcher.io.xNegInput := {
-          if (x == dimx - 1) cores(0)(y).switch.io.xNegOutput
-          else cores(x + 1)(y).switch.io.xNegOutput
-        }
-        switch_watcher.io.yInput := {
-          if (y == 0) cores(x)(dimy - 1).switch.io.yOutput
-          else cores(x)(y - 1).switch.io.yOutput
-        }
-        switch_watcher.io.yNegInput := {
-          if (y == dimy - 1) cores(x)(0).switch.io.yNegOutput
-          else cores(x)(y + 1).switch.io.yNegOutput
-        }
-        switch_watcher.io.lInput := cores(x)(y).core.io.packet_out
+        // Observe the switch's ACTUAL input nets (post-boundary), not the raw
+        // neighbour outputs: at edge switches the real inputs flow through the
+        // TorusBoundary (seam ingress / closed-cut wrap), so tapping neighbours
+        // directly makes the watcher blind exactly where seam traffic enters.
+        switch_watcher.io.xInput    := cores(x)(y).switch.io.xInput
+        switch_watcher.io.xNegInput := cores(x)(y).switch.io.xNegInput
+        switch_watcher.io.yInput    := cores(x)(y).switch.io.yInput
+        switch_watcher.io.yNegInput := cores(x)(y).switch.io.yNegInput
+        switch_watcher.io.lInput    := cores(x)(y).core.io.packet_out
 
         // Terminal-delivery + activation trace: one line per NoC terminal delivery
         // (cycle, dest core, dest register, value) and per core-activation rising

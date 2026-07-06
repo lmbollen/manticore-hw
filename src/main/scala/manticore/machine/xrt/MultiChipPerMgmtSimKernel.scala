@@ -111,10 +111,10 @@ class MultiChipPerMgmtSimKernel(
       new ManticoreFlatArray(
         chipDimX,
         chipDimY,
-        // set to (n == 0) to get TERM/INJ/GMEM traces on the reporter chip for
-        // correlating seam-crossed deliveries against the schedule (see the
-        // debug(sim) instrumentation in ManticoreFlatArray/Processor)
-        debug_enable = false,
+        // set to (n == <chip>) to get TERM/INJ/GMEM traces + the exact switch
+        // collision detector on that chip (see the debug(sim) instrumentation in
+        // ManticoreFlatArray/Processor); sys-prop permgmt.debugchip selects it
+        debug_enable = sys.props.get("permgmt.debugchip").map(_.toInt).contains(n),
         enable_custom_alu,
         torusDimX = gDimX,
         torusDimY = gDimY,
@@ -298,10 +298,15 @@ class MultiChipPerMgmtSimKernel(
               )
             }
           }
-        pktProbe("aOut", a.fwdOut)
-        pktProbe("bIn", b.fwdIn)
-        pktProbe("bOut", b.bwdOut)
-        pktProbe("aIn", a.bwdIn)
+        pktProbe("aOut", a.fwdOut) // fwd stream, a->b: capture
+        pktProbe("bIn", b.fwdIn) // fwd stream, a->b: delivery
+        pktProbe("bOut", b.bwdOut) // bwd stream, b->a: capture
+        pktProbe("aIn", a.bwdIn) // bwd stream, b->a: delivery
+        // each cable direction carries TWO global-edge streams; probe the twins too
+        pktProbe("bFwdOut", b.fwdOut) // fwd-twin, b->a: capture (e.g. 13|14 north)
+        pktProbe("aFwdIn", a.fwdIn) // fwd-twin, b->a: delivery
+        pktProbe("aBwdOut", a.bwdOut) // bwd-twin, a->b: capture (e.g. 14|13 south)
+        pktProbe("bBwdIn", b.bwdIn) // bwd-twin, a->b: delivery
       }
 
       // DEBUG (seam-direction probe): count each end's transmitted frames and print the

@@ -126,7 +126,19 @@ class MultiChipPerMgmtSimTester extends AnyFlatSpec with ChiselScalatestTester w
     info(s"loaded ${nChips} per-chip images; sizes=${imgs.map(_.image.length).mkString(",")}")
 
     test(
-      new MultiChipPerMgmtSimKernel(chipCols, chipRows, chipDimX, chipDimY, cableLatency = cableLatency)
+      // enable_custom_alu MUST match the compiled image: the demo images are compiled
+      // WITH custom functions (masm default; the init programs carry CONFIGCFU), like
+      // the rig's CFU-enabled bitstream. With the kernel's default (false) every
+      // CF-extracted computation is dead silicon and the whole guest sits in an
+      // all-zero fixed-point from vcycle 0 — indistinguishable from a transport bug.
+      new MultiChipPerMgmtSimKernel(
+        chipCols,
+        chipRows,
+        chipDimX,
+        chipDimY,
+        enable_custom_alu = sys.props.getOrElse("permgmt.cfu", "true").toBoolean,
+        cableLatency = cableLatency
+      )
     ).withAnnotations(Seq(VerilatorBackendAnnotation)) { dut =>
       dut.clock.setTimeout(0)
       for (n <- 0 until nChips) {
