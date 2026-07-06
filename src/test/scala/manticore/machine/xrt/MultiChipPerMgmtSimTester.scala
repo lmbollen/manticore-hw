@@ -309,8 +309,15 @@ class MultiChipPerMgmtSimTester extends AnyFlatSpec with ChiselScalatestTester w
         rdMem(reporter, 2) | (rdMem(reporter, 3) << 16),
         rdMem(reporter, 4) | (rdMem(reporter, 5) << 16)
       )
+      // Second $display statement ("CHK %d %d %d", eid 2): three reporter-LOCAL states
+      // (8-bit +3 counter, 16-bit LFSR, 32-bit accumulator) at trace words [6][7][8,9]
+      // (globally-unique offsets, so both statements' finals coexist in gmem). Because
+      // the CHK states never leave the reporter's process, their final values must be
+      // interpreter-golden EVEN while cross-seam application values are under debug —
+      // a pure end-to-end check of the multi-state $display/trace mechanism.
+      val chk = (rdMem(reporter, 6), rdMem(reporter, 7), rdMem(reporter, 8) | (rdMem(reporter, 9) << 16))
       info(s"MAIN (armed) ended after $g cycles: reporter eid=$eid vc=$vc " +
-        s"gateViolation=$gateViol overflow=$muxOvf dataloss=$loss finalSIG=$sig")
+        s"gateViolation=$gateViol overflow=$muxOvf dataloss=$loss finalSIG=$sig finalCHK=$chk")
       info(s"DIAG first-trip: overflow @cyc=$fOvfC vc=$fOvfVc | gateViol @cyc=$fGateC vc=$fGateVc | dataloss @cyc=$fLossC vc=$fLossVc")
       info(s"DIAG vc froze at cyc=$lastVcChangeC vc=$lastVc (frozenFor=$frozenFor); per-chip stop=${(0 until nChips).map(n => s"$n:${stopped(n)}").mkString(",")}")
       info(s"DIAG per-chip vc=${(0 until nChips).map(n => s"$n:${deviceVc(n)}").mkString(",")}")
@@ -319,6 +326,13 @@ class MultiChipPerMgmtSimTester extends AnyFlatSpec with ChiselScalatestTester w
       assert(!gateViol, "seam clock gated while a frame was in flight (stall not on an empty boundary)")
       assert(!loss, "TDM seam demux dropped a packet (real data loss)")
       assert(eid == 1, s"reporter did not reach FINISH (eid=$eid) within $g cycles; vc=$vc")
+      // Multi-state $display mechanism check (reporter-local, seam-independent): the final CHK
+      // record must be the interpreter golden (last display at cyc 895; masm interpret 2026-07-06).
+      // Asserted BEFORE the seam-dependent sig2 so a transport regression can't mask a display-
+      // mechanism regression (or vice versa).
+      val goldenFinalChk = (125, 38621, 115254)
+      assert(chk == goldenFinalChk,
+        s"final CHK $chk != golden $goldenFinalChk — the $$display/trace mechanism itself broke")
       // DATA-DEPENDENT correctness: the final seam-crossed sig2 must reach the golden fold value;
       // a broken inter-chip NoC would deliver a wrong (or unchanged) sig2 even when the reporter
       // still reaches FINISH on its fixed cycle schedule. (sig0/sig1 reported, not asserted.)

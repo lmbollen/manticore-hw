@@ -18,7 +18,7 @@ class Pico84SingleChipTester extends AnyFlatSpec with ChiselScalatestTester with
 
   val dir      = sys.props.getOrElse("pico84.dir", "/tmp/pico84_plain")
   val userBase = 16384
-  val FLUSH    = Set(0)
+  val FLUSH    = Set(0, 2) // eid 0 = SIG display, eid 2 = CHK display (manifest)
   val FINISH   = Set(1)
 
   def readWords(p: String): Array[Int] = {
@@ -94,33 +94,54 @@ class Pico84SingleChipTester extends AnyFlatSpec with ChiselScalatestTester with
           assert(!(eid > 0xffff), s"$n timed out")
         }
 
+        // Two $display statements (manifest): eid 0 = "SIG %d %d %d" at trace
+        // words [0,1][2,3][4,5]; eid 2 = "CHK %d %d %d" at words [6][7][8,9]
+        // (8-bit counter, 16-bit LFSR, 32-bit accumulator — three distinct
+        // reporter-local states, verifying the multi-statement/multi-state
+        // $display mechanism with globally-unique trace offsets). FINISH = 1.
         val sigs     = scala.collection.mutable.ArrayBuffer.empty[(Int, Int, Int)]
+        val chks     = scala.collection.mutable.ArrayBuffer.empty[(Int, Int, Int)]
         val cmdFlush = BigInt(2) << 56
         var (eid, vc) = run(baseM, cmdWord(0, to))
         var flushes = 0
-        while (FLUSH.contains(eid) && flushes < 16) {
+        while (FLUSH.contains(eid) && flushes < 20) {
           run(baseM, cmdFlush)
-          val w0 = rdMem(0) | (rdMem(1) << 16)
-          val w1 = rdMem(2) | (rdMem(3) << 16)
-          val w2 = rdMem(4) | (rdMem(5) << 16)
-          sigs += ((w0, w1, w2))
-          info(f"  SIG#$flushes%-2d $w0 $w1 $w2")
+          if (eid == 0) {
+            val w0 = rdMem(0) | (rdMem(1) << 16)
+            val w1 = rdMem(2) | (rdMem(3) << 16)
+            val w2 = rdMem(4) | (rdMem(5) << 16)
+            sigs += ((w0, w1, w2))
+            info(f"  flush#$flushes%-2d SIG $w0 $w1 $w2")
+          } else {
+            val cnt  = rdMem(6)
+            val lfsr = rdMem(7)
+            val acc  = rdMem(8) | (rdMem(9) << 16)
+            chks += ((cnt, lfsr, acc))
+            info(f"  flush#$flushes%-2d CHK $cnt $lfsr $acc")
+          }
           val r = run(baseM, cmdWord(1, to))
           eid = r._1; vc = r._2
           flushes += 1
         }
-        info(s"MAIN terminated: eid=$eid vcycles=$vc after $flushes SIG flushes")
-        assert(FINISH.contains(eid) && vc == 1025 && flushes == 4,
-          s"structural mismatch: eid=$eid vc=$vc flushes=$flushes")
+        info(s"MAIN terminated: eid=$eid vcycles=$vc after $flushes flushes (${sigs.length} SIG + ${chks.length} CHK)")
+        assert(FINISH.contains(eid) && vc == 1025 && sigs.length == 4 && chks.length == 4,
+          s"structural mismatch: eid=$eid vc=$vc flushes=$flushes sig=${sigs.length} chk=${chks.length}")
         val golden = Seq((20, 20, 20), (96, 96, 96), (193, 193, 193), (225, 225, 225))
-        // The full triple is asserted. Historic note: sig0/sig1 used to read (1, 0) and
-        // (with the reworked scheduler) sig2 read 0 — root-caused to two RTL bugs, both
-        // fixed: (a) the Switch's south-turn branches clobbered terminal_reg, silently
-        // masking same-cycle terminal deliveries (33/1394 sends per vcycle lost); (b)
-        // MemoryIntercept sampled gmem addr/wdata one cycle after start (a gmem
-        // clock-kill-era contract), corrupting every display GST burst.
+        // Interpreter golden for the CHK states (masm interpret, 2026-07-06):
+        // cnt = 3*127 mod 256 = 125 at every display (the +3 counter aliases
+        // with the 256-cycle display period — deliberately kept: it detects a
+        // display firing on the wrong cycle); LFSR/accumulator vary.
+        val goldenChk = Seq((125, 34117, 16165), (125, 51001, 49302), (125, 4669, 82965), (125, 38621, 115254))
+        // Both statements' full sequences are asserted. Historic note: sig0/sig1
+        // used to read (1, 0) and (with the reworked scheduler) sig2 read 0 —
+        // root-caused to two RTL bugs, both fixed: (a) the Switch's south-turn
+        // branches clobbered terminal_reg, silently masking same-cycle terminal
+        // deliveries (33/1394 sends per vcycle lost); (b) MemoryIntercept sampled
+        // gmem addr/wdata one cycle after start (a gmem clock-kill-era contract),
+        // corrupting every display GST burst.
         assert(sigs.toSeq == golden, s"SIG values $sigs != golden $golden")
-        info(s"single-chip 8x4: EXACT value match incl. all SIG values")
+        assert(chks.toSeq == goldenChk, s"CHK values $chks != golden $goldenChk")
+        info(s"single-chip 8x4: EXACT value match incl. all SIG and CHK values")
       }
   }
 }
