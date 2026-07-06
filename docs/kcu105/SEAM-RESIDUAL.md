@@ -60,16 +60,19 @@ compiler dumps; offline correlator `correlate8.py`):
    the phantoms are legit packets whose hop/route state got mangled crossing a
    seam (which would simultaneously explain a dead victim and a phantom).
 
-4. **The latencies CSV is physically implausible for specific cables.** The
-   authoritative `manticore-latencies` output (golden-UGN derived; identical
-   to `/tmp/latencies_demo_v2.csv`) distributes as: 67–72 for most cables
-   (sane groomed-seam values), but **15** (×24 edges), **122/123** (×24), and
-   **1298** (×8) for specific directed cables. The 1298 edges are exactly the
-   chip(0,1)→chip(0,0) cable in both wrap directions. Suggestive structure:
-   122 ≈ 68 + 54 and 15 ≈ 69 − 54 (a ±54 pairing), while 1298 is out of any
-   physical range (~70 expected). Prime suspect: a sign/modulo/fold-direction
-   bug in the UGN→latency derivation for the fold's *reverse* cables — or bad
-   entries in the golden UGN table itself.
+4. **The latency spread across cables is REAL, and the divergence tracks the
+   extreme link.** The authoritative `manticore-latencies` output (golden-UGN
+   derived) spans 15…1298 cycles per directed cable: most are 67–72, one
+   direction reads **1298** (the chip(0,1)→chip(0,0) cable, both of its
+   global-edge groups `(·,2,south)`/`(·,13,north)`), others 15 and 122/123.
+   The high-latency link is a KNOWN property of the rig — not a bug. What
+   matters is that the model-vs-RTL divergence concentrates exactly on it:
+   ~70-cycle links are handled cycle-exact, while every never-delivered
+   transaction crosses the 1298 link. Note the operating envelope: with
+   period 8, T=1298 means a 1287-deep wire pipe (a packet spends ~46% of the
+   2825-cycle vcycle in flight on one hop), and T=15 leaves only a 4-deep
+   pipe — both are far outside the T≈25 regime where the TDM bridge
+   invariants were designed and property-tested.
 
 5. **Placement decides which values die.** The CHK experiment made this
    crisp: the same program compiled twice put the CHK state cones on
@@ -127,22 +130,27 @@ CSV audit is first.
 
 ## Prioritized next steps
 
-1. **Audit `manticore-latencies`** (bittide-instances, Latencies.hs) — the
-   UGN→latency derivation for fold-reverse cables. Cross-check each directed
-   cable against the WireDemo's per-link golden UGN table; the ±54 pairing
-   and the 1298 outliers should fall out immediately. Regenerate, recompile,
-   rerun the 8-chip sim (the tester consumes the same CSV for its cable
-   models, so consistency is automatic).
-2. **Phantom forensics** (if anything survives step 1): enable
-   `debug_enable` on chip (0,1) as well, trace both ends of the
-   chip(0,1)→chip(0,0) cable with the hop-field probes, and diff the TDM
-   frame at capture vs emit. All tooling exists (`[TERM]/[SENDOUT]/[XOUT…]`
-   probes, `correlate8.py`, per-chip dumps).
-3. **Stall-tile margin** (compiler): pad the post-last-RECV window by
+1. **Directed TDM-bridge unit tests at the real extremes** — add
+   T = 1298 (deep) and T = 15 (shallow) cases to `TdmStaticLatencyTester` /
+   `TdmLinkTester` (exact constant-latency delivery, no duplication, no
+   frame-field corruption, correct behavior across many slot phases and
+   back-to-back same-link trains). Minutes to run; either convicts or
+   acquits the bridge at extreme T.
+2. **Phantom forensics on the long cable**: enable `debug_enable` on chip
+   (0,1) as well, trace both ends of the chip(0,1)→chip(0,0) cable with the
+   hop-field probes, and diff each TDM frame at capture vs emit. A
+   hop-corruption or duplication is caught red-handed in one run. All
+   tooling exists (`[TERM]/[SENDOUT]/[XOUT…]` probes, `correlate8.py`,
+   per-chip dumps).
+3. **Audit the compiler's window/reservation model for T ≫ period and
+   T ≈ period+4**: the no-wrap-around assumption, mux slot-phase
+   accounting over ~160 in-flight periods, and same-link burst spacing at
+   these depths (the victims sit mid-burst in 8-cycle trains).
+4. **Stall-tile margin** (compiler): pad the post-last-RECV window by
    `tdmPeriod + margin` when hop latencies are configured, so the cross-chip
    heartbeat can never land in sleep. Small, local to
    `ProgramSchedulingTransform.finalizeScheduleWithReceives`.
-4. Re-run the cascade: 8-chip sim → rig. The data-dependent asserts
+5. Re-run the cascade: 8-chip sim → rig. The data-dependent asserts
    (sig2 == 225, full SIG triple reported; CHK already green) make the
    endpoint unambiguous.
 
