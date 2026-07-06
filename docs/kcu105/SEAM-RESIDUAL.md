@@ -95,38 +95,42 @@ compiler dumps; offline correlator `correlate8.py`):
 
 ## Analysis
 
-Two levels of defect are in play, probably coupled through the CSV:
+The latencies are ground truth (the CSV drives both the compiler's schedule
+and the sim's cable models, and the high-latency link is a known rig
+property), so the sim is a faithful model and its residual divergence is the
+real bug: with clock control verified live for the whole run, the bittide
+abstraction guarantees constant-latency links, and frames must be neither
+lost nor duplicated. They demonstrably are — so **something in our layers
+(TDM bridge, boundary ingress, or the compiler's reservation/window model)
+is incorrect specifically in the extreme-latency regime**, while the nominal
+~70-cycle regime is cycle-exact.
 
-**A. The schedule is built against wrong seam latencies (highest priority).**
-The compiler reserves NoC windows and places RECVs using the CSV. In the sim
-the cables are *built from the same CSV* (a 1298 entry literally becomes a
-1287-deep wire pipe), so model and sim mostly agree — which is why 373/380
-deliver exactly and only subtle residuals (the 7 victims, the phantoms)
-remain. On the **rig**, however, the physical cable latency is whatever the
-groomed hardware does (~70); images scheduled against 15/122/1298 have their
-recv windows and link reservations positioned wrongly for those cables, so
-everything routed over them arrives off-model — clobbered registers, missed
-windows, frozen chains. (Pre-fix rig runs compiled with *no* latencies at
-all — seams as 1-cycle hops — and failed the same way; the HITL pipeline now
-at least uses the authoritative CSV.) The observed rig ≡ sim agreement is at
-the outcome level (which chains die), not necessarily the micro-mechanism
-level.
+Concretely, packets crossing the 1298 link either:
 
-**B. Something at the seam ingress corrupts or duplicates specific packets
-(the phantoms), even in the CSV-consistent sim.** Candidate mechanisms, all
-testable with the existing probes: hop-field damage across the TDM frame
-pack/unpack, duplication at the boundary capture, or an interaction between
-the (absurdly deep) 1298 wire pipes and the vcycle wrap in the reservation
-model (the model doesn't wrap; the comment's no-wrap argument assumes sane
-seam latencies). A corrupted-hops packet both never arrives at its true
-destination (a "victim") and terminates somewhere illegal (a "phantom"),
-which matches the data qualitatively; the counts (7 victims vs ~21 phantom
-signatures) leave room for duplication as well.
+- **die in transit** (the 7 victims — never seen at the destination switch,
+  no collision event at their terminals, mux-overflow and demux-loss flags
+  silent), and/or
+- **reappear as phantoms** — packets terminating at cores/registers no
+  transaction targets, at stable early-vcycle positions, colliding with
+  legitimately-scheduled traffic. A packet whose hop fields got mangled
+  crossing the seam would produce exactly this pair of symptoms (victim +
+  phantom); duplication at capture or a bank-release misalignment at extreme
+  T are alternative producers.
 
-If the CSV derivation bug is real and fixed, hypothesis B may partially or
-wholly evaporate (sane latencies → shallow pipes → no wrap pathology, and the
-schedule stops placing traffic into colliding positions). That is why the
-CSV audit is first.
+Static review of the bridge shows the obvious things are right — the demux
+release counter is sized from `totalLatency`, the `age` field is sender-side
+slot wait (period-bounded, no accumulation over the wire), the cable
+constructor pairs each direction's wire depth with its demux latency
+correctly, and the wire-depth contract `T = period + wire + 3` holds by
+construction at both extremes. But the property tests sweep small random T
+(≈10–42) and never overlap in-flight same-link packets, whereas the demo
+holds ~160 frames of one link in flight at the designed 1-cycle release
+margin — `TdmExtremeLatencyTester` now covers exactly that regime
+(T ∈ {15, 71, 122, 1298}, period-spaced trains, exact delivery-set
+equality). The compiler side has an analogous untested corner: the
+reservation model's no-wrap-around argument and mux slot-phase accounting
+were reasoned about for T ≈ 25–70, not for links where a packet is in
+flight for half a vcycle.
 
 ## Prioritized next steps
 

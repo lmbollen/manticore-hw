@@ -280,6 +280,30 @@ class MultiChipPerMgmtSimKernel(
       demuxOverflows += (bridgeA.io.demuxOverflow && !bypassW)
       demuxOverflows += (bridgeB.io.demuxOverflow && !bypassW)
 
+      // DEBUG (frame-level capture/delivery trace): for cables named in the
+      // `seampkt.cables` sys-prop (comma-separated nameHints), print EVERY packet at
+      // the four boundary points of the cable with full identity, so an offline diff
+      // proves per-packet conservation across the seam: everything captured must be
+      // delivered exactly once, `latency` cycles later, unmodified. [SPKT <name> <pt>]
+      // with pt in {aOut (a captures for a->b), bIn (delivered into b), bOut (b
+      // captures for b->a), aIn (delivered into a)}.
+      if (sys.props.getOrElse("seampkt.cables", "").split(',').contains(nameHint)) {
+        val spktTime = RegInit(0.U(64.W))
+        spktTime := spktTime + 1.U
+        def pktProbe(pt: String, v: Vec[NoCBundle]): Unit =
+          for (i <- 0 until v.length) {
+            when(v(i).valid) {
+              printf(
+                p"[SPKT $nameHint $pt] cyc=${spktTime} link=$i reg=${v(i).address} data=${v(i).data} xh=${v(i).xHops} yh=${v(i).yHops}\n"
+              )
+            }
+          }
+        pktProbe("aOut", a.fwdOut)
+        pktProbe("bIn", b.fwdIn)
+        pktProbe("bOut", b.bwdOut)
+        pktProbe("aIn", a.bwdIn)
+      }
+
       // DEBUG (seam-direction probe): count each end's transmitted frames and print the
       // first few plus periodic totals. Distinguishes "b-side (the neighbour's south/west
       // side) never transmits" from "transmits but is not delivered" when chasing one-way
