@@ -1,10 +1,14 @@
 # The seam problem — SOLVED (2026-07-06)
 
-**Resolution.** Two stacked root causes, both found via the sim-as-baseline
-frame-conservation hunt and both fixed; the 8-chip demo sim now passes its
-full data-dependent golden for the first time — `SIG = (225,225,225)`,
-`CHK = (128,11707,115475)`, FINISH at vc 1033, zero overflow/loss/gate
-violations.
+**Resolution.** Three stacked root causes; the first two were found via the
+sim-as-baseline frame-conservation hunt, after which the 8-chip demo sim
+passed its full data-dependent golden for the first time — `SIG =
+(225,225,225)`, `CHK = (128,11707,115475)`, FINISH at vc 1033, zero
+overflow/loss/gate violations. The rig still read `SIG = (0,0,0)` with the
+identical software, which isolated the third cause to the one thing the sim
+cannot check by construction: whether the latencies CSV matches the physical
+rig (the sim builds its cables FROM the CSV, so any self-consistent value
+stays green).
 
 1. **Compiler: register reservations anchored at hop ARRIVAL, not physical
    occupancy** (manticore-compiler `2b203f9`). A hop's near-end switch
@@ -29,6 +33,32 @@ violations.
    indistinguishable from a transport bug. This confounded ALL prior 8-chip
    sim results (the rig never had this issue). The tester now enables the
    CFU (`-Dpermgmt.cfu`).
+
+3. **Rig-only: the latencies CSV borrowed the WireDemo's `internalDelay =
+   −4`, but the Manticore seam datapath needs −2** (bittide-hardware
+   `dc71acff`). The CSV formula is `latency = goldenUGN + marginFrames +
+   internalDelay + period + 3`, where `internalDelay` backtracks the
+   MU-measured UGN to the application's tap points. WireDemo's −4 was
+   measured for ITS ring-buffer PE taps; the Manticore seam ports sit at
+   different pipeline depths. Exact register accounting (per directed
+   cable, `P` = physical flight GTH-TX-register → elastic-buffer output):
+   the UGN probe path has **5** stages around `P` (`sendUgn` stamps
+   combinationally at the ring-buffer TX point → handshake TX `dflipflop`
+   → `gthTxR` → P → `rxs2` → `rxs4` → `captureUgn`'s input register,
+   captured combinationally on trigger), while the seam port-to-port path
+   has **3** (`gthTxR` → P → `rxs2` → `mkSeamIn` register). The
+   bridge-internal stages cancel exactly between rig and sim — the chip's
+   static `seamLatency=26 / wireLat=15` bridge and the sim kernels'
+   per-CSV bridges both hold frames `totalLatency−4−wireLat−age = 7−age`
+   cycles — so the effective seam latency in groomed chip counters is
+   `UGN+margin + 9` while the CSV said `UGN+margin + 7`: **every seam
+   frame landed 2 cycles later than the compiler's schedule assumed**,
+   uniformly, in both directions of every cable. Mistimed epilogue
+   injection at every destination ⇒ seam-crossed `SIG = (0,0,0)` while
+   chip-local `CHK` stayed golden — and WireDemo keeps passing since −4
+   is correct for its own taps. Fixed as a Manticore-specific
+   `seamInternalDelay = −2` in `ManticoreDemo/Latencies.hs` (all 160
+   directed seam rows move up by exactly 2).
 
 **What the hunt verified along the way** (the bittide abstraction holds):
 the TDM link core is exact at T ∈ {15, 71, 122, 1298} in directed tests
