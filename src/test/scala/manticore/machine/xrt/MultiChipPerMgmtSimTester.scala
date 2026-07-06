@@ -327,12 +327,18 @@ class MultiChipPerMgmtSimTester extends AnyFlatSpec with ChiselScalatestTester w
       assert(!loss, "TDM seam demux dropped a packet (real data loss)")
       assert(eid == 1, s"reporter did not reach FINISH (eid=$eid) within $g cycles; vc=$vc")
       // Multi-state $display mechanism check (reporter-local, seam-independent): the final CHK
-      // record must be the interpreter golden (last display at cyc 895; masm interpret 2026-07-06).
+      // record must be the interpreter golden (last display at cyc 895, next-value semantics; masm interpret 2026-07-06).
       // Asserted BEFORE the seam-dependent sig2 so a transport regression can't mask a display-
       // mechanism regression (or vice versa).
-      val goldenFinalChk = (125, 38621, 115254)
+      val goldenFinalChk = (128, 11707, 115475)
+      // NOTE: the extractor/splitter may re-partition the CHK state cones onto other
+      // cores despite the next-value-display co-location nudge; until the cross-seam
+      // residual is fixed, a CHK mismatch here can therefore also mean "this compile
+      // placed part of the CHK cone across a broken seam" (verified mechanism-correct
+      // on the rig run 28774339849 and single-chip; the counter word is the most
+      // placement-robust of the three).
       assert(chk == goldenFinalChk,
-        s"final CHK $chk != golden $goldenFinalChk — the $$display/trace mechanism itself broke")
+        s"final CHK $chk != golden $goldenFinalChk — display mechanism OR cross-seam placement of the CHK cone")
       // DATA-DEPENDENT correctness: the final seam-crossed sig2 must reach the golden fold value;
       // a broken inter-chip NoC would deliver a wrong (or unchanged) sig2 even when the reporter
       // still reaches FINISH on its fixed cycle schedule. (sig0/sig1 reported, not asserted.)

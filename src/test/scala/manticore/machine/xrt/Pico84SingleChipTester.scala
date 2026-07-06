@@ -127,11 +127,12 @@ class Pico84SingleChipTester extends AnyFlatSpec with ChiselScalatestTester with
         assert(FINISH.contains(eid) && vc == 1025 && sigs.length == 4 && chks.length == 4,
           s"structural mismatch: eid=$eid vc=$vc flushes=$flushes sig=${sigs.length} chk=${chks.length}")
         val golden = Seq((20, 20, 20), (96, 96, 96), (193, 193, 193), (225, 225, 225))
-        // Interpreter golden for the CHK states (masm interpret, 2026-07-06):
-        // cnt = 3*127 mod 256 = 125 at every display (the +3 counter aliases
-        // with the 256-cycle display period — deliberately kept: it detects a
-        // display firing on the wrong cycle); LFSR/accumulator vary.
-        val goldenChk = Seq((125, 34117, 16165), (125, 51001, 49302), (125, 4669, 82965), (125, 38621, 115254))
+        // Interpreter golden for the CHK states (masm interpret, 2026-07-06; the
+        // display reads the NEXT-value wires, so cnt = 3*128 mod 256 = 128 at
+        // every display — the counter aliasing with the 256-cycle display
+        // period is deliberate: it detects a display firing on the wrong
+        // cycle. LFSR/accumulator vary per display.)
+        val goldenChk = Seq((128, 2698, 16234), (128, 36466, 49359), (128, 9339, 83026), (128, 11707, 115475))
         // Both statements' full sequences are asserted. Historic note: sig0/sig1
         // used to read (1, 0) and (with the reworked scheduler) sig2 read 0 —
         // root-caused to two RTL bugs, both fixed: (a) the Switch's south-turn
