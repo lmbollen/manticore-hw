@@ -1,4 +1,54 @@
-# The remaining seam problem — status, evidence, analysis (2026-07-06)
+# The seam problem — SOLVED (2026-07-06)
+
+**Resolution.** Two stacked root causes, both found via the sim-as-baseline
+frame-conservation hunt and both fixed; the 8-chip demo sim now passes its
+full data-dependent golden for the first time — `SIG = (225,225,225)`,
+`CHK = (128,11707,115475)`, FINISH at vc 1033, zero overflow/loss/gate
+violations.
+
+1. **Compiler: register reservations anchored at hop ARRIVAL, not physical
+   occupancy** (manticore-compiler `2b203f9`). A hop's near-end switch
+   register is physically occupied one cycle after the previous hop — a slow
+   seam link spends its latency BETWEEN registers, in the TDM bridge. The
+   model reserved the cell at departure+L instead of departure+1: identical
+   for 1-cycle intra-chip hops (single-chip schedules bit-identical, which is
+   why single-chip was always exact), off by L−1 on seam links (1297 cycles
+   on the known long cable). Physically-colliding register uses at
+   seam-adjacent switches were invisible to the scheduler; in RTL the
+   higher-priority port won and the loser was silently dropped (caught live:
+   a northbound transit killed by a westbound turn at (0,13), every vcycle).
+   Post-fix the image has zero physically-colliding register writes
+   (exhaustive offline check), zero undelivered transactions, and every
+   delivery lands at exactly the modeled cycle.
+
+2. **Sim harness: CFU mismatch** (manticore-hw `55a4c29`). The demo images
+   are compiled WITH custom functions (matching the rig's CFU-enabled
+   bitstream), but `MultiChipPerMgmtSimKernel` elaborated its arrays with
+   `enable_custom_alu = false` — every CF-extracted computation was dead
+   silicon and the guest sat in an all-zero fixed-point from vcycle 0,
+   indistinguishable from a transport bug. This confounded ALL prior 8-chip
+   sim results (the rig never had this issue). The tester now enables the
+   CFU (`-Dpermgmt.cfu`).
+
+**What the hunt verified along the way** (the bittide abstraction holds):
+the TDM link core is exact at T ∈ {15, 71, 122, 1298} in directed tests
+(`TdmExtremeLatencyTester`, incl. ~160 in-flight same-link frames), and in
+vivo all eight stream endpoints of every probed cable conserve perfectly —
+~2.5M packet events, exact counts, constant per-pair latency equal to the
+CSV, zero corruption. No frames are lost or duplicated at any seam.
+
+**Tooling left in place**: `[SPKT]` per-cable frame-conservation probes
+(`-Dseampkt.cables`), per-chip debug (`-Dpermgmt.debugchip`), the fixed
+debug-watcher wiring (edge switches were blind before), the exact
+per-register collision detector, and the offline correlators
+(conservation diff, route-conformance vs binary-decoded SENDs, physical
+collision predictor, data-progression frontier).
+
+Historical analysis below (pre-resolution evidence trail).
+
+---
+
+# The remaining seam problem — status, evidence, analysis (historical)
 
 **Symptom.** On the 8-chip demo (2×4 grid of 4×4 chips = folded 8×16 global torus),
 `loop_multi`'s reporter reads `SIG = (0, 0, 0)` instead of the interpreter golden
